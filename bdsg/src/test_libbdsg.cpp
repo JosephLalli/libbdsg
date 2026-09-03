@@ -699,7 +699,88 @@ void test_serializable_handle_graphs() {
     cerr << "SerializableHandleGraph tests successful!" << endl;
 }
 
+template<typename Graph>
+void test_bulk_edge_deletion() {
+    // Exercise a batch large enough to cross the 20% edge-record defragmentation
+    // threshold, with many deletions from one adjacency list and some edges left.
+    constexpr size_t hub_edges = 4096;
+    constexpr size_t deleted_hub_edges = 3072;
+    constexpr nid_t self_edge_node_id = hub_edges + 2;
+    constexpr size_t initial_edge_count = hub_edges + 2;
+    constexpr size_t deletion_count = deleted_hub_edges + 1;
+
+    Graph repeated_graph;
+    Graph bulk_graph;
+
+    auto populate = [&](Graph& graph) {
+        for (nid_t id = 1; id <= self_edge_node_id; ++id) {
+            graph.create_handle("A", id);
+        }
+
+        handle_t hub = graph.get_handle(1);
+        for (nid_t id = 2; id < self_edge_node_id; ++id) {
+            graph.create_edge(hub, graph.get_handle(id));
+        }
+
+        // Keep this ordinary edge while removing most edges incident on the hub.
+        graph.create_edge(graph.get_handle(2), graph.get_handle(3));
+
+        // A reversing self edge has one adjacency record instead of two.
+        handle_t self_edge_node = graph.get_handle(self_edge_node_id);
+        graph.create_edge(self_edge_node, graph.flip(self_edge_node));
+
+        // Edge deletion must not disturb stored paths.
+        path_handle_t path = graph.create_path_handle("kept_path");
+        graph.append_step(path, graph.get_handle(2));
+        graph.append_step(path, graph.get_handle(3));
+    };
+
+    auto produce_deleted_edges = [&](Graph& graph, const auto& emit) {
+        handle_t hub = graph.get_handle(1);
+        for (nid_t id = 2; id < 2 + deleted_hub_edges; ++id) {
+            emit(graph.edge_handle(hub, graph.get_handle(id)));
+        }
+        handle_t self_edge_node = graph.get_handle(self_edge_node_id);
+        emit(graph.edge_handle(self_edge_node, graph.flip(self_edge_node)));
+    };
+
+    populate(repeated_graph);
+    populate(bulk_graph);
+    assert(repeated_graph.get_edge_count() == initial_edge_count);
+    assert(bulk_graph.get_edge_count() == initial_edge_count);
+
+    produce_deleted_edges(repeated_graph, [&](const edge_t& edge) {
+        repeated_graph.destroy_edge(edge.first, edge.second);
+    });
+
+    size_t emitted = 0;
+    bulk_graph.destroy_edges_bulk([&](const auto& emit) {
+        produce_deleted_edges(bulk_graph, [&](const edge_t& edge) {
+            emit(edge);
+            ++emitted;
+            // This assertion runs before the final defragmentation and verifies
+            // that the deleted-record bookkeeping keeps edge counts exact.
+            assert(bulk_graph.get_edge_count() == initial_edge_count - emitted);
+        });
+    });
+
+    assert(emitted == deletion_count);
+    assert(repeated_graph.get_edge_count() == initial_edge_count - deletion_count);
+    assert(bulk_graph.get_edge_count() == initial_edge_count - deletion_count);
+    assert(repeated_graph.get_degree(repeated_graph.get_handle(1), false)
+           == hub_edges - deleted_hub_edges);
+    assert(bulk_graph.get_degree(bulk_graph.get_handle(1), false)
+           == hub_edges - deleted_hub_edges);
+    assert(!bulk_graph.has_edge(bulk_graph.get_handle(self_edge_node_id),
+                                bulk_graph.flip(bulk_graph.get_handle(self_edge_node_id))));
+    assert(handlegraph::algorithms::are_equivalent_with_paths(&repeated_graph,
+                                                               &bulk_graph, true));
+}
+
 void test_deletable_handle_graphs() {
+
+    test_bulk_edge_deletion<PackedGraph>();
+    test_bulk_edge_deletion<MappedPackedGraph>();
     
     // first batch of tests
     {

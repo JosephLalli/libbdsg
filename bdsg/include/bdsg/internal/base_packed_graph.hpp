@@ -199,6 +199,17 @@ public:
     /// Ignores nonexistent edges.
     /// Does not update any stored paths.
     void destroy_edge(const handle_t& left, const handle_t& right);
+
+    /// Remove a batch of edges while deferring the adjacency-list defragmentation
+    /// check until the entire batch has been unlinked. The producer is called once
+    /// with an emitter that accepts an edge_t; it must emit existing, distinct edges
+    /// serially and must not mutate this graph itself.
+    ///
+    /// This is intentionally not part of the generic HandleGraph interface. Packed
+    /// adjacency mutation is not thread-safe, but batching avoids repeatedly scanning
+    /// and rebuilding the packed edge storage during large deletion workloads.
+    template<typename EdgeProducer>
+    void destroy_edges_bulk(EdgeProducer&& produce_edges);
     
     /// Remove all nodes and edges. Does not update any stored paths.
     void clear(void);
@@ -1843,6 +1854,34 @@ void BasePackedGraph<Backend>::destroy_edge(const handle_t& left, const handle_t
         remove_edge_reference(flip(right), flip(left));
     }
     defragment();
+}
+
+template<typename Backend>
+template<typename EdgeProducer>
+void BasePackedGraph<Backend>::destroy_edges_bulk(EdgeProducer&& produce_edges) {
+    bool removed_any = false;
+
+    // Keep mutation serial: two edges can share an adjacency list, and neither
+    // PackedVector nor the linked-list pointer updates are thread-safe. Unlinking
+    // does not move records, so their 1-based indices remain valid throughout the
+    // batch; unreachable records are accounted for by the deletion counters.
+    std::forward<EdgeProducer>(produce_edges)([&](const edge_t& edge) {
+        const handle_t& left = edge.first;
+        const handle_t& right = edge.second;
+        remove_edge_reference(left, right);
+        if (left != flip(right)) {
+            // A reversing self edge has only the first adjacency record.
+            remove_edge_reference(flip(right), flip(left));
+        }
+        removed_any = true;
+    });
+
+    // A single final check avoids the pathological vg prune tail caused by
+    // repeated whole-storage compactions. Match an empty destroy_edge loop by
+    // doing no unrelated defragmentation when the producer emitted no edges.
+    if (removed_any) {
+        defragment();
+    }
 }
 
 template<typename Backend>

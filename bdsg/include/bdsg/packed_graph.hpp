@@ -25,6 +25,14 @@ using namespace handlegraph;
  * In-memory implementation of MutablePathDeletableHandleGraph
  */
 class PackedGraph : public GraphProxy<BasePackedGraph<>> {
+public:
+    /// Stream a serial batch of existing, distinct edges to the packed backing
+    /// implementation and defer its defragmentation check until the batch ends.
+    template<typename EdgeProducer>
+    void destroy_edges_bulk(EdgeProducer&& produce_edges) {
+        get()->destroy_edges_bulk(std::forward<EdgeProducer>(produce_edges));
+    }
+
 protected:
     /**
      * Get the object that actually provides the graph methods.
@@ -48,6 +56,13 @@ protected:
  */
 class MappedPackedGraph : public GraphProxy<BasePackedGraph<MappedBackend>>, public TriviallySerializable {
 public:
+
+    /// Stream a serial batch of existing, distinct edges to the mapped packed
+    /// implementation and defer its defragmentation check until the batch ends.
+    template<typename EdgeProducer>
+    void destroy_edges_bulk(EdgeProducer&& produce_edges) {
+        get()->destroy_edges_bulk(std::forward<EdgeProducer>(produce_edges));
+    }
 
     // We need constructors, destructors, copy, and move because we are keeping
     // the graph we are proxying for in mapped memory.
