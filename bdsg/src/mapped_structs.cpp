@@ -5,10 +5,12 @@
 #include "bdsg/internal/mapped_structs.hpp"
 
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <iomanip>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +40,40 @@ const Manager::chainid_t Manager::NO_CHAIN;
  * mapping. Mapping address is the key in address_space_index.
  */
 struct Manager::LinkRecord {
+    /**
+     * Process-local acceleration for the persisted allocator free list. The
+     * linked list in the mapped chain remains authoritative so this cache can
+     * always be discarded and rebuilt without changing the native format.
+     */
+    struct FreeListIndex {
+        /// All free blocks ordered by stable chain offset.
+        std::set<size_t> by_offset;
+        /// All free blocks ordered by payload size, then stable chain offset.
+        std::set<std::pair<size_t, size_t>> by_size;
+
+        void insert(size_t offset, size_t size) {
+            auto offset_inserted = by_offset.insert(offset);
+            if (!offset_inserted.second) {
+                throw std::runtime_error("Duplicate free block offset while indexing allocator");
+            }
+            try {
+                auto size_inserted = by_size.emplace(size, offset);
+                if (!size_inserted.second) {
+                    throw std::runtime_error("Duplicate free block size and offset while indexing allocator");
+                }
+            } catch (...) {
+                by_offset.erase(offset_inserted.first);
+                throw;
+            }
+        }
+
+        bool erase(size_t offset, size_t size) noexcept {
+            bool erased_offset = by_offset.erase(offset) == 1;
+            bool erased_size = by_size.erase(std::make_pair(size, offset)) == 1;
+            return erased_offset && erased_size;
+        }
+    };
+
     /// Offset of the start of the mapping in the chain (cumulative sum)
     size_t offset;
     /// Number of bytes in the mapping.
@@ -133,6 +169,86 @@ public:
     /// info data structures; always acquire this mutex *BEFORE* LOCKING CHAIN
     /// INFO, if you are going to hold both simultaneously.
     std::unique_ptr<std::mutex> allocator_mutex;
+
+    /// Optional process-local free-list index, only present on the first link.
+    std::unique_ptr<FreeListIndex> free_list_index;
+
+    /// Drop the optional cache. The persisted linked list remains valid.
+    void invalidate_free_list_index() noexcept {
+        free_list_index.reset();
+    }
+
+    /**
+     * Build the optional cache from the persisted linked list. Return false
+     * if heap allocation for the cache fails so callers can use the linked
+     * list without making an arena allocation fail.
+     */
+    bool ensure_free_list_index(chainid_t chain, AllocatorHeader* header) {
+        if (free_list_index) {
+            return true;
+        }
+
+        try {
+            auto rebuilt = std::make_unique<FreeListIndex>();
+            AllocatorBlock* previous = nullptr;
+            AllocatorBlock* block = header->first_free;
+            size_t previous_offset = 0;
+            bool have_previous_offset = false;
+
+            while (block) {
+                auto location = Manager::get_chain_and_position(block, sizeof(AllocatorBlock));
+                if (location.first != chain) {
+                    throw std::runtime_error("Allocator free block belongs to another chain");
+                }
+                if (block->prev != previous) {
+                    throw std::runtime_error("Allocator free-list back pointer is inconsistent");
+                }
+                if (have_previous_offset && location.second <= previous_offset) {
+                    throw std::runtime_error("Allocator free list is not ordered by chain offset");
+                }
+                rebuilt->insert(location.second, block->size);
+                previous = block;
+                previous_offset = location.second;
+                have_previous_offset = true;
+                block = block->next;
+            }
+
+            if (previous != header->last_free) {
+                throw std::runtime_error("Allocator last-free pointer is inconsistent");
+            }
+
+            free_list_index = std::move(rebuilt);
+            return true;
+        } catch (const std::bad_alloc&) {
+            // The cache is optional. Release any partial cache and let the
+            // caller use the persisted linked list.
+            invalidate_free_list_index();
+            return false;
+        }
+    }
+
+    /** Add a block to an existing cache, invalidating it on any failure. */
+    bool index_free_block(size_t offset, size_t size) noexcept {
+        if (!free_list_index) {
+            return false;
+        }
+        try {
+            free_list_index->insert(offset, size);
+            return true;
+        } catch (...) {
+            invalidate_free_list_index();
+            return false;
+        }
+    }
+
+    /** Remove a block from an existing cache, invalidating it on mismatch. */
+    bool unindex_free_block(size_t offset, size_t size) noexcept {
+        if (!free_list_index || !free_list_index->erase(offset, size)) {
+            invalidate_free_list_index();
+            return false;
+        }
+        return true;
+    }
 };
 
 // Give the static members a compilation unit
@@ -161,7 +277,8 @@ Manager::chainid_t Manager::create_chain(const std::string& prefix) {
     return chain;
 }
 
-Manager::chainid_t Manager::create_chain(int fd, const std::string& prefix) {
+Manager::chainid_t Manager::create_chain(int fd, const std::string& prefix,
+                                         size_t initial_size) {
     if (prefix.size() > MAX_PREFIX_SIZE) {
         // Prefix is too long and allocator might not fit.
         throw std::runtime_error("Prefix of " + std::to_string(prefix.size()) +
@@ -171,9 +288,20 @@ Manager::chainid_t Manager::create_chain(int fd, const std::string& prefix) {
     if (!fd) {
         throw std::runtime_error("File descriptor must be set for memory mapping a file.");
     }
+
+    if (initial_size == 0) {
+        initial_size = BASE_SIZE;
+    }
+    if (initial_size < BASE_SIZE) {
+        throw std::invalid_argument("Initial mapped chain size must be at least " +
+                                    std::to_string(BASE_SIZE) + " bytes");
+    }
+    if (initial_size > static_cast<uintmax_t>(std::numeric_limits<off_t>::max())) {
+        throw std::overflow_error("Initial mapped chain size exceeds off_t");
+    }
     
     // Make a chain from a file, which may have data already.
-    std::pair<chainid_t, bool> chain_info = open_chain(fd, BASE_SIZE);
+    std::pair<chainid_t, bool> chain_info = open_chain(fd, initial_size);
     auto& chain = chain_info.first;
     auto& had_data = chain_info.second;
     
@@ -196,13 +324,13 @@ Manager::chainid_t Manager::create_chain(int fd, const std::string& prefix) {
             std::copy(prefix.begin(), prefix.end(), start);
             
             // Set up the allocator data structures.
-            set_up_allocator_at(chain, prefix.size(), BASE_SIZE - prefix.size());
+            set_up_allocator_at(chain, prefix.size(), initial_size - prefix.size());
         }
-    } catch (std::exception& e) {
+    } catch (...) {
         // Clean up the chain because anyone who catches won't be able to.
         destroy_chain(chain);
         
-        throw e;
+        throw;
     }
     
 #ifdef debug_manager
@@ -210,6 +338,25 @@ Manager::chainid_t Manager::create_chain(int fd, const std::string& prefix) {
 #endif
     
     return chain;
+}
+
+Manager::chainid_t Manager::create_empty_chain(int fd, const std::string& prefix,
+                                               size_t initial_size) {
+    if (fd <= 0) {
+        throw std::invalid_argument("File descriptor must be positive for a file-backed chain");
+    }
+    if (initial_size != 0 && initial_size < BASE_SIZE) {
+        throw std::invalid_argument("Initial mapped chain size must be at least " +
+                                    std::to_string(BASE_SIZE) + " bytes");
+    }
+    if (initial_size > static_cast<uintmax_t>(std::numeric_limits<off_t>::max())) {
+        throw std::overflow_error("Initial mapped chain size exceeds off_t");
+    }
+    if (ftruncate(fd, 0) != 0) {
+        throw std::runtime_error("Could not truncate mapped backing file: " +
+                                 std::string(strerror(errno)));
+    }
+    return create_chain(fd, prefix, initial_size);
 }
 
 Manager::chainid_t Manager::create_chain(const std::function<std::string(void)>& iterator, const std::string& prefix) {
@@ -799,32 +946,67 @@ void* Manager::allocate_from(chainid_t chain, size_t bytes) {
         return allocated;
     }
     
+    if (bytes > std::numeric_limits<size_t>::max() - sizeof(AllocatorBlock)) {
+        throw std::bad_array_new_length();
+    }
+
     // How much space do we need with block overhead, if we need a new block?
     size_t block_bytes = bytes + sizeof(AllocatorBlock);
     
-    AllocatorBlock* found;
+    AllocatorBlock* found = nullptr;
+
+    // The first link owns process-local state for the whole chain. Map nodes
+    // are stable, and with_allocator_header() uses this record's mutex.
+    LinkRecord* first_link;
+    {
+        std::shared_lock<std::shared_timed_mutex> lock(Manager::mutex);
+        first_link = &address_space_index.at((intptr_t) chain);
+    }
     
     with_allocator_header(chain, [&](AllocatorHeader* header) {
         // With exclusive use of the free list
     
-        // This will hold a ref to the free block we found or made that is big enough to hold this item.
-        // Starts null if there is no first_free.
-        found = header->first_free;
+        // Prefer the smallest fitting free block. This changes only allocator
+        // placement; the persisted linked-list format and graph values are
+        // unchanged. If the optional heap index cannot be built, retain the
+        // old linked-list first-fit fallback.
+        bool found_in_index = false;
+        if (first_link->ensure_free_list_index(chain, header)) {
+            auto indexed = first_link->free_list_index->by_size.lower_bound(
+                std::make_pair(bytes, (size_t) 0));
+            if (indexed != first_link->free_list_index->by_size.end()) {
+                found = static_cast<AllocatorBlock*>(get_address_in_chain(
+                    chain, indexed->second, sizeof(AllocatorBlock)));
+                if (found->size != indexed->first) {
+                    // Never trust stale cache contents over the mapped list.
+                    first_link->invalidate_free_list_index();
+                    found = nullptr;
+                } else {
+                    found_in_index = true;
+                }
+            }
+        }
+
+        if (!first_link->free_list_index) {
+            // This will hold a ref to the first free block big enough for the
+            // item, or null if no such block exists.
+            found = header->first_free;
 #ifdef debug_manager
-        std::cerr << "Start at " << (intptr_t) found << std::endl;
+            std::cerr << "Start at " << (intptr_t) found << std::endl;
 #endif
-        while (found && found->size < bytes) {
-            // Won't fit here. Try the next place.
+            while (found && found->size < bytes) {
+                // Won't fit here. Try the next place.
 #ifdef debug_manager
-            std::cerr << "Skip block of " << found->size << " bytes at " << (intptr_t) found << std::endl;
+                std::cerr << "Skip block of " << found->size << " bytes at " << (intptr_t) found << std::endl;
 #endif
-            AllocatorBlock* old = found;
-            assert(found != found->next);
-            found = found->next;
-            if (found && found->prev != old) {
-                throw std::runtime_error("Free block " + std::to_string((intptr_t) found) +
-                    " must point back to " + std::to_string((intptr_t) old) + " but instead points to " +
-                    std::to_string((intptr_t) found->prev));
+                AllocatorBlock* old = found;
+                assert(found != found->next);
+                found = found->next;
+                if (found && found->prev != old) {
+                    throw std::runtime_error("Free block " + std::to_string((intptr_t) found) +
+                        " must point back to " + std::to_string((intptr_t) old) + " but instead points to " +
+                        std::to_string((intptr_t) found->prev));
+                }
             }
         }
        
@@ -883,9 +1065,22 @@ void* Manager::allocate_from(chainid_t chain, size_t bytes) {
                 header->first_free = found;
             }
         }
+
+        // Remove an existing selected block from the cache before changing
+        // its size or links. Erase cannot allocate; on any mismatch the cache
+        // is discarded and the persisted list remains authoritative.
+        if (found_in_index) {
+            auto location = get_chain_and_position(found, sizeof(AllocatorBlock));
+            if (location.first != chain) {
+                first_link->invalidate_free_list_index();
+                found_in_index = false;
+            } else if (!first_link->unindex_free_block(location.second, found->size)) {
+                found_in_index = false;
+            }
+        }
         
         // Now we can allocate (part of) this block.
-        
+        AllocatorBlock* remainder = nullptr;
         if (found->size > block_bytes) {
             // We could break the user data off of this block and have some space left over.
             // TODO: use a min block size here instead.
@@ -895,15 +1090,15 @@ void* Manager::allocate_from(chainid_t chain, size_t bytes) {
 #endif
             
             // So split the block.
-            AllocatorBlock* second = found->split(bytes);
+            remainder = found->split(bytes);
             
 #ifdef debug_manager
-            std::cerr << "Created block of " << second->size << " bytes at " << (intptr_t)second << std::endl;
+            std::cerr << "Created block of " << remainder->size << " bytes at " << (intptr_t)remainder << std::endl;
 #endif
             
             if (header->last_free == found) {
                 // And fix up the end of the linked list
-                header->last_free = second;
+                header->last_free = remainder;
             }
         }
         
@@ -927,6 +1122,18 @@ void* Manager::allocate_from(chainid_t chain, size_t bytes) {
 #ifdef debug_manager
             std::cerr << "\tWas last free block; now that's " << (intptr_t)header->last_free.get() << std::endl;
 #endif
+        }
+
+        // A split leaves one new free block. Cache allocation failure cannot
+        // make the arena allocation fail after the persisted list changed;
+        // index_free_block() simply invalidates the optional cache.
+        if (remainder && first_link->free_list_index) {
+            auto location = get_chain_and_position(remainder, sizeof(AllocatorBlock));
+            if (location.first != chain) {
+                first_link->invalidate_free_list_index();
+            } else {
+                first_link->index_free_block(location.second, remainder->size);
+            }
         }
         
         if (!header->first_allocated) {
@@ -1083,8 +1290,10 @@ void Manager::deallocate(void* address) {
     std::cerr << "Deallocate at " << address << std::endl;
 #endif
     
-    // Find the chain
-    chainid_t chain = get_chain(address);
+    // Find the chain and stable chain position once. The old insertion scan
+    // recomputed this position for the block on every free-list hop.
+    auto address_location = get_chain_and_position(address);
+    chainid_t chain = address_location.first;
     
     if (chain == NO_CHAIN) {
         // This isn't really ours.
@@ -1102,6 +1311,17 @@ void Manager::deallocate(void* address) {
     
     // Find the block
     AllocatorBlock* found = AllocatorBlock::get_from_data(address);
+    auto found_location = get_chain_and_position(found, sizeof(AllocatorBlock));
+    if (found_location.first != chain) {
+        throw std::runtime_error("Allocator block header belongs to another chain");
+    }
+    const size_t found_offset = found_location.second;
+
+    LinkRecord* first_link;
+    {
+        std::shared_lock<std::shared_timed_mutex> lock(Manager::mutex);
+        first_link = &address_space_index.at((intptr_t) chain);
+    }
     
 #ifdef debug_manager
     std::cerr << "Freeing block at " << (intptr_t)found << std::endl;
@@ -1121,26 +1341,73 @@ void Manager::deallocate(void* address) {
             throw std::runtime_error("Detected double-free!");
         }
        
-        // Find the block in the free list after it, if any
-        AllocatorBlock* right = header->first_free;
-        
-        while(right && Manager::get_chain_and_position(right).second < Manager::get_chain_and_position(found).second) {
-            // We have a free block, but it occurs before the block being freed in the chain.
-            // TODO: can we save chain lookups here somehow?
-            // Go to the next free block, or off the end if that was the last one.
-#ifdef debug_manager
-            std::cerr << "\tComes after block " << (intptr_t)right << " in chain space" << std::endl;
-#endif
-            right = right->next;
+        // Find the neighboring free blocks by chain offset. Fall back to the
+        // persisted address-ordered list if the optional cache could not be
+        // allocated.
+        AllocatorBlock* left = nullptr;
+        AllocatorBlock* right = nullptr;
+        size_t left_offset = 0;
+        size_t right_offset = 0;
+        size_t left_size = 0;
+        size_t right_size = 0;
+        bool indexed_neighbors = first_link->ensure_free_list_index(chain, header);
+
+        if (indexed_neighbors) {
+            auto right_it = first_link->free_list_index->by_offset.lower_bound(found_offset);
+            if (right_it != first_link->free_list_index->by_offset.end()) {
+                if (*right_it == found_offset) {
+                    throw std::runtime_error("Detected double-free!");
+                }
+                right_offset = *right_it;
+                right = static_cast<AllocatorBlock*>(get_address_in_chain(
+                    chain, right_offset, sizeof(AllocatorBlock)));
+            }
+            if (right_it != first_link->free_list_index->by_offset.begin()) {
+                auto left_it = right_it;
+                --left_it;
+                left_offset = *left_it;
+                left = static_cast<AllocatorBlock*>(get_address_in_chain(
+                    chain, left_offset, sizeof(AllocatorBlock)));
+            }
+
+            // Validate that the cache-selected neighbors are adjacent in the
+            // authoritative linked list before using them.
+            if ((left && left->next != right) ||
+                (right && right->prev != left) ||
+                (!left && header->first_free != right) ||
+                (!right && header->last_free != left)) {
+                first_link->invalidate_free_list_index();
+                indexed_neighbors = false;
+                left = nullptr;
+                right = nullptr;
+            } else {
+                if (left) {
+                    left_size = left->size;
+                }
+                if (right) {
+                    right_size = right->size;
+                }
+            }
         }
-        AllocatorBlock* left;
-        if (!right) {
-            // The new block should be the last block in the list.
-            // So it comes after the existing last block, if any.
-            left = header->last_free;
-        } else {
-            // The new block comes between right and its free predecessor, if any
-            left = right->prev;
+
+        if (!indexed_neighbors) {
+            right = header->first_free;
+            while (right && Manager::get_chain_and_position(right).second < found_offset) {
+                // We have a free block, but it occurs before the block being freed in the chain.
+                // Go to the next free block, or off the end if that was the last one.
+#ifdef debug_manager
+                std::cerr << "\tComes after block " << (intptr_t)right << " in chain space" << std::endl;
+#endif
+                right = right->next;
+            }
+            if (!right) {
+                // The new block should be the last block in the list.
+                // So it comes after the existing last block, if any.
+                left = header->last_free;
+            } else {
+                // The new block comes between right and its free predecessor, if any.
+                left = right->prev;
+            }
         }
         
         // Wire in the block
@@ -1166,6 +1433,26 @@ void Manager::deallocate(void* address) {
         // need to update the last free.
         if (header->last_free == bounds.second) {
             header->last_free = bounds.first;
+        }
+
+        if (indexed_neighbors && first_link->free_list_index) {
+            // Before insertion, the free list is coalesced, so only the
+            // immediate left and right neighbors can join the new block.
+            bool expected_bounds = (bounds.first == found || bounds.first == left) &&
+                (bounds.second == found || bounds.second == right);
+            bool index_ok = expected_bounds;
+            if (index_ok && bounds.first == left) {
+                index_ok = first_link->unindex_free_block(left_offset, left_size);
+            }
+            if (index_ok && bounds.second == right) {
+                index_ok = first_link->unindex_free_block(right_offset, right_size);
+            }
+            if (index_ok && first_link->free_list_index) {
+                size_t coalesced_offset = bounds.first == left ? left_offset : found_offset;
+                first_link->index_free_block(coalesced_offset, bounds.first->size);
+            } else if (!index_ok) {
+                first_link->invalidate_free_list_index();
+            }
         }
     });
     
@@ -1287,6 +1574,92 @@ void Manager::scan_chain(chainid_t chain, const std::function<void(const void*, 
     }
 }
 
+void Manager::checkpoint_and_evict(chainid_t chain) {
+    if (chain == NO_CHAIN) {
+        throw std::runtime_error("Cannot checkpoint an unmanaged memory chain");
+    }
+
+    const long configured_page_size = sysconf(_SC_PAGESIZE);
+    if (configured_page_size <= 0) {
+        throw std::runtime_error("Could not determine system page size: " +
+                                 std::string(strerror(errno)));
+    }
+    const size_t page_size = static_cast<size_t>(configured_page_size);
+
+    struct MappingRange {
+        void* start;
+        size_t length;
+        size_t chain_offset;
+    };
+    std::vector<MappingRange> ranges;
+
+    // Keep mappings from being extended or destroyed while system calls use
+    // their addresses. Callers separately guarantee that graph data is not
+    // being mutated concurrently.
+    std::unique_lock<std::shared_timed_mutex> lock(Manager::mutex);
+    auto chain_it = chain_space_index.find(chain);
+    if (chain_it == chain_space_index.end()) {
+        throw std::runtime_error("Cannot checkpoint unknown memory chain " +
+                                 std::to_string(chain));
+    }
+    auto head_it = address_space_index.find(chain);
+    if (head_it == address_space_index.end()) {
+        throw std::runtime_error("Memory chain has no head mapping");
+    }
+    if (head_it->second.fd == 0) {
+        throw std::runtime_error("Cannot checkpoint an anonymous memory chain");
+    }
+
+    ranges.reserve(chain_it->second.size());
+    for (const auto& link_at_offset : chain_it->second) {
+        auto link_it = address_space_index.find(link_at_offset.second);
+        if (link_it == address_space_index.end() || !link_it->second.is_mapped()) {
+            throw std::runtime_error("File-backed memory chain contains an unmapped link");
+        }
+        const uintptr_t data_start =
+            static_cast<uintptr_t>(link_it->second.get_mapped_address());
+        const uintptr_t aligned_start = data_start - (data_start % page_size);
+        const size_t leading_bytes = static_cast<size_t>(data_start - aligned_start);
+        if (link_it->second.length > std::numeric_limits<size_t>::max() - leading_bytes) {
+            throw std::overflow_error("Mapped checkpoint range length overflow");
+        }
+        ranges.push_back({reinterpret_cast<void*>(aligned_start),
+                          leading_bytes + link_it->second.length,
+                          link_at_offset.first});
+    }
+
+    auto call_with_eintr_retry = [](const std::function<int(void)>& operation) {
+        int result;
+        do {
+            result = operation();
+        } while (result != 0 && errno == EINTR);
+        return result;
+    };
+
+    // Finish the entire durability phase before beginning eviction, so an
+    // msync failure leaves all pages resident for inspection or retry.
+    for (const auto& range : ranges) {
+        if (call_with_eintr_retry([&]() {
+                return msync(range.start, range.length, MS_SYNC);
+            }) != 0) {
+            const int saved_errno = errno;
+            throw std::runtime_error("Could not synchronize mapped chain at byte " +
+                                     std::to_string(range.chain_offset) + ": " +
+                                     std::string(strerror(saved_errno)));
+        }
+    }
+    for (const auto& range : ranges) {
+        if (call_with_eintr_retry([&]() {
+                return madvise(range.start, range.length, MADV_DONTNEED);
+            }) != 0) {
+            const int saved_errno = errno;
+            throw std::runtime_error("Could not evict mapped chain at byte " +
+                                     std::to_string(range.chain_offset) + ": " +
+                                     std::string(strerror(saved_errno)));
+        }
+    }
+}
+
 Manager::AllocatorHeader* Manager::find_allocator_header(chainid_t chain) {
     
     assert(chain != NO_CHAIN);
@@ -1351,8 +1724,17 @@ size_t Manager::reclaim_tail(chainid_t chain) {
     
     // Track how many bytes we removed
     size_t reclaimed_bytes = 0;
+
+    LinkRecord* first_link;
+    {
+        std::shared_lock<std::shared_timed_mutex> lock(Manager::mutex);
+        first_link = &address_space_index.at((intptr_t) chain);
+    }
     
     with_allocator_header(chain, [&](AllocatorHeader* header) {
+        // This operation only runs while tearing down a chain. Release the
+        // process-local cache before detaching persisted trailing blocks.
+        first_link->invalidate_free_list_index();
         while (header->last_free) {
             // For each free block, end to start
             AllocatorBlock* last_free = header->last_free;
@@ -1494,26 +1876,35 @@ std::pair<Manager::chainid_t, bool> Manager::open_chain(int fd, size_t start_siz
         
         // Duplicate the FD so we can own our own and close it later.
         int our_fd = dup(fd);
-        if (!our_fd) {
+        if (our_fd < 0) {
             throw std::runtime_error("Could not duplicate file descriptor: " + std::string(strerror(errno)));
         }
     
         // We can only map a nonempty file.
         struct stat fileinfo;
         if (fstat(our_fd, &fileinfo)) {
-            throw std::runtime_error("Could not stat file: " + std::string(strerror(errno)));
+            const int saved_errno = errno;
+            close(our_fd);
+            throw std::runtime_error("Could not stat file: " + std::string(strerror(saved_errno)));
         }
         size_t file_size = fileinfo.st_size;
         // TODO: check st_blksize and try to use a multiple of that for allocating.
         if (file_size < start_size) {
             // The file is currently too small and we need to expand it to be able to write to it.
             if (ftruncate(our_fd, start_size)) {
-                throw std::runtime_error("Could not grow file to be mapped: " + std::string(strerror(errno)));
+                const int saved_errno = errno;
+                close(our_fd);
+                throw std::runtime_error("Could not grow file to be mapped: " + std::string(strerror(saved_errno)));
             }
         }
         
         // Make the MIO mapping of the whole file, or throw.
-        record.map_file(our_fd);
+        try {
+            record.map_file(our_fd);
+        } catch (...) {
+            close(our_fd);
+            throw;
+        }
     
         // Remember where the memory starts
         mapping_address = record.get_mapped_address();
@@ -1851,6 +2242,9 @@ void Manager::connect_allocator_at(chainid_t chain, size_t offset) {
         LinkRecord& head = Manager::address_space_index.at((intptr_t) chain);
         // Save the allocator position
         head.prefix_size = offset;
+        // Native loads and raw chain copies carry only the persisted linked
+        // list. Rebuild the process-local index lazily on first mutation.
+        head.invalidate_free_list_index();
     }
     
     if (check_chains) {
@@ -1997,4 +2391,3 @@ bool Manager::AllocatorBlock::immediately_before(const AllocatorBlock* other) co
 }
 
 }
-

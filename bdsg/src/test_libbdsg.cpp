@@ -5,6 +5,9 @@
 //
 
 #include <stdio.h>
+#include <array>
+#include <cstring>
+#include <exception>
 #include <iostream>
 #include <vector>
 #include <cassert>
@@ -14,6 +17,7 @@
 #include <thread>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <algorithm>
 
@@ -253,6 +257,162 @@ void test_mapped_structs() {
     
     assert(yomo::Manager::count_chains() == 0);
     assert(yomo::Manager::count_links() == 0);
+
+    {
+        // Exercise the process-local free-list indexes through the public
+        // allocator API. Keep the first allocation alive because the mapped
+        // format uses it to locate the root object after a remap.
+        auto chain = yomo::Manager::create_chain("IDX");
+        void* anchor = yomo::Manager::allocate_from(chain, 16);
+        std::memset(anchor, 0xA5, 16);
+
+        // Zero-sized and exact-fit blocks remain valid allocator operations.
+        void* zero = yomo::Manager::allocate_from(chain, 0);
+        void* zero_guard = yomo::Manager::allocate_from(chain, 16);
+        yomo::Manager::deallocate(zero);
+        void* zero_again = yomo::Manager::allocate_from(chain, 0);
+        assert(zero_again == zero);
+        yomo::Manager::deallocate(zero_again);
+
+        bool double_free_rejected = false;
+        try {
+            yomo::Manager::deallocate(zero_again);
+        } catch (const std::runtime_error& error) {
+            double_free_rejected = std::string(error.what()) == "Detected double-free!";
+        }
+        assert(double_free_rejected);
+
+        // Make two isolated holes. Best-fit should select the later, smaller
+        // one; an address-first scan would select the earlier large one.
+        void* large_hole = yomo::Manager::allocate_from(chain, 512);
+        void* guard1 = yomo::Manager::allocate_from(chain, 32);
+        void* small_hole = yomo::Manager::allocate_from(chain, 128);
+        void* guard2 = yomo::Manager::allocate_from(chain, 32);
+        yomo::Manager::deallocate(large_hole);
+        yomo::Manager::deallocate(small_hole);
+        void* best_fit = yomo::Manager::allocate_from(chain, 100);
+        assert(best_fit == small_hole);
+        yomo::Manager::deallocate(best_fit);
+        void* exact_fit = yomo::Manager::allocate_from(chain, 128);
+        assert(exact_fit == small_hole);
+
+        // Split the large hole, consume the exact remainder, and free both
+        // pieces so coalescing recreates the original block.
+        void* split_first = yomo::Manager::allocate_from(chain, 200);
+        assert(split_first == large_hole);
+        void* split_remainder = yomo::Manager::allocate_from(chain, 272);
+        yomo::Manager::deallocate(split_first);
+        yomo::Manager::deallocate(split_remainder);
+        void* coalesced = yomo::Manager::allocate_from(chain, 512);
+        assert(coalesced == large_hole);
+        yomo::Manager::deallocate(coalesced);
+
+        // Force another link and verify stable chain offsets work when mapped
+        // addresses are unrelated.
+        const size_t size_before_extension = yomo::Manager::get_chain_size(chain);
+        void* cross_link = yomo::Manager::allocate_from(chain, 8192);
+        const size_t cross_link_offset =
+            yomo::Manager::get_chain_and_position(cross_link).second;
+        assert(yomo::Manager::get_chain_size(chain) > size_before_extension);
+        assert(cross_link_offset >= size_before_extension);
+        yomo::Manager::deallocate(cross_link);
+        void* cross_link_again = yomo::Manager::allocate_from(chain, 8192);
+        assert(yomo::Manager::get_chain_and_position(cross_link_again).second ==
+               cross_link_offset);
+        yomo::Manager::deallocate(cross_link_again);
+
+        (void)zero_guard;
+        (void)guard1;
+        (void)guard2;
+        (void)exact_fit;
+        yomo::Manager::check_heap_integrity(chain);
+        yomo::Manager::destroy_chain(chain);
+    }
+
+    assert(yomo::Manager::count_chains() == 0);
+    assert(yomo::Manager::count_links() == 0);
+
+    {
+        // A native file reopen and a raw chain copy must lazily reconstruct
+        // their indexes from the persisted free list before mutation.
+        char filename[] = "mapped-indexXXXXXX";
+        int fd = mkstemp(filename);
+        assert(fd != -1);
+        auto chain = yomo::Manager::create_empty_chain(fd, "IDX", 4096);
+        void* root = yomo::Manager::allocate_from(chain, 16);
+        std::memset(root, 0x5A, 16);
+        void* large_hole = yomo::Manager::allocate_from(chain, 400);
+        yomo::Manager::allocate_from(chain, 32);
+        void* small_hole = yomo::Manager::allocate_from(chain, 100);
+        yomo::Manager::allocate_from(chain, 2048);
+        const size_t large_offset =
+            yomo::Manager::get_chain_and_position(large_hole).second;
+        const size_t small_offset =
+            yomo::Manager::get_chain_and_position(small_hole).second;
+        yomo::Manager::deallocate(large_hole);
+        yomo::Manager::deallocate(small_hole);
+        yomo::Manager::check_heap_integrity(chain);
+        yomo::Manager::destroy_chain(chain);
+
+        chain = yomo::Manager::create_chain(fd, "IDX");
+        root = yomo::Manager::find_first_allocation(chain, 16);
+        for (size_t i = 0; i < 16; ++i) {
+            assert(static_cast<unsigned char*>(root)[i] == 0x5A);
+        }
+        void* reopened_fit = yomo::Manager::allocate_from(chain, 90);
+        assert(yomo::Manager::get_chain_and_position(reopened_fit).second == small_offset);
+
+        auto copied_chain = yomo::Manager::get_dissociated_chain(chain);
+        void* copied_fit = yomo::Manager::allocate_from(copied_chain, 300);
+        assert(yomo::Manager::get_chain_and_position(copied_fit).second == large_offset);
+        yomo::Manager::check_heap_integrity(chain);
+        yomo::Manager::check_heap_integrity(copied_chain);
+        yomo::Manager::destroy_chain(copied_chain);
+        yomo::Manager::destroy_chain(chain);
+        assert(close(fd) == 0);
+        unlink(filename);
+    }
+
+    assert(yomo::Manager::count_chains() == 0);
+    assert(yomo::Manager::count_links() == 0);
+
+    {
+        // The existing per-chain allocator mutex must continue to serialize
+        // cache and persisted-list changes from concurrent allocators.
+        auto chain = yomo::Manager::create_chain("IDX");
+        yomo::Manager::allocate_from(chain, 16);
+        constexpr size_t thread_count = 4;
+        constexpr size_t allocations_per_thread = 128;
+        std::array<std::exception_ptr, thread_count> errors{};
+        std::vector<std::thread> threads;
+        for (size_t thread_number = 0; thread_number < thread_count; ++thread_number) {
+            threads.emplace_back([&, thread_number]() {
+                try {
+                    std::vector<void*> allocations;
+                    allocations.reserve(allocations_per_thread);
+                    for (size_t i = 0; i < allocations_per_thread; ++i) {
+                        allocations.push_back(yomo::Manager::allocate_from(
+                            chain, 8 + ((i * 37 + thread_number * 11) % 384)));
+                    }
+                    for (auto it = allocations.rbegin(); it != allocations.rend(); ++it) {
+                        yomo::Manager::deallocate(*it);
+                    }
+                } catch (...) {
+                    errors[thread_number] = std::current_exception();
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        for (const auto& error : errors) {
+            if (error) {
+                std::rethrow_exception(error);
+            }
+        }
+        yomo::Manager::check_heap_integrity(chain);
+        yomo::Manager::destroy_chain(chain);
+    }
     
     {
     
@@ -5013,6 +5173,262 @@ void test_mapped_packed_graph() {
         assert(graph_contents.at(1) == "GATTACA");
         assert(graph_contents.at(2) == "CATTAG");
     };
+
+    auto populate_wire_fixture = [](auto& graph) {
+        handle_t h10 = graph.create_handle("AC", 10);
+        handle_t h42 = graph.create_handle("G", 42);
+        handle_t h1000 = graph.create_handle("TTN", 1000);
+        handle_t removed = graph.create_handle("C", 777);
+
+        graph.create_edge(h10, graph.flip(h42));
+        graph.create_edge(graph.flip(h42), h1000);
+        graph.create_edge(removed, h10);
+        graph.destroy_edge(removed, h10);
+        graph.destroy_handle(removed);
+
+        path_handle_t repeated = graph.create_path_handle("repeat/reverse");
+        graph.append_step(repeated, h10);
+        graph.append_step(repeated, graph.flip(h42));
+        graph.append_step(repeated, h10);
+        graph.append_step(repeated, h1000);
+
+        path_handle_t circular = graph.create_path_handle("circular", true);
+        graph.append_step(circular, h1000);
+        graph.append_step(circular, graph.flip(h10));
+
+        // Keep enough live path slots that deleting one does not trigger the
+        // automatic path-table compaction threshold.
+        for (size_t i = 0; i < 5; ++i) {
+            graph.create_path_handle("empty" + std::to_string(i));
+        }
+        path_handle_t removed_path = graph.create_path_handle("deleted");
+        graph.append_step(removed_path, h42);
+        graph.destroy_path(removed_path);
+    };
+
+    // The mapped standard serializer must match the ordinary PackedGraph
+    // bytes, including SDSL headers and padding, for the same mutation history.
+    char wire_filename[] = "mapped-wireXXXXXX";
+    int wire_fd = mkstemp(wire_filename);
+    assert(wire_fd != -1);
+
+    PackedGraph ordinary;
+    populate_wire_fixture(ordinary);
+    std::ostringstream ordinary_out;
+    ordinary.serialize(ordinary_out);
+    const std::string expected_wire = ordinary_out.str();
+
+    {
+        MappedPackedGraph mapped(wire_fd);
+        populate_wire_fixture(mapped);
+        assert(handlegraph::algorithms::are_equivalent_with_paths(&ordinary, &mapped, true));
+
+        // A deliberately tiny interval exercises repeated eviction while the
+        // graph remains usable and serializable.
+        std::ostringstream mapped_out;
+        mapped.serialize_packed_graph(mapped_out, 64);
+        assert(mapped_out.str() == expected_wire);
+
+        mapped.checkpoint_and_evict();
+        assert(handlegraph::algorithms::are_equivalent_with_paths(&ordinary, &mapped, true));
+
+        std::ostringstream after_evict_out;
+        mapped.serialize_packed_graph(after_evict_out, 64);
+        assert(after_evict_out.str() == expected_wire);
+
+        PackedGraph reloaded_standard;
+        std::istringstream standard_in(after_evict_out.str());
+        reloaded_standard.deserialize(standard_in);
+        assert(handlegraph::algorithms::are_equivalent_with_paths(&ordinary,
+                                                                   &reloaded_standard,
+                                                                   true));
+
+        std::ostringstream reserialized;
+        reloaded_standard.serialize(reserialized);
+        assert(reserialized.str() == expected_wire);
+    }
+    assert(close(wire_fd) == 0);
+    unlink(wire_filename);
+
+    auto path_order = [](const auto& graph) {
+        vector<string> names;
+        graph.for_each_path_handle([&](const path_handle_t& path) {
+            names.push_back(graph.get_path_name(path));
+        });
+        return names;
+    };
+
+    // Load the ordinary wire representation directly into file-backed
+    // storage, close the caller-owned FD, and retain exact standard bytes.
+    char inverse_filename[] = "mapped-inverseXXXXXX";
+    int inverse_fd = mkstemp(inverse_filename);
+    assert(inverse_fd != -1);
+    {
+        MappedPackedGraph mapped(inverse_fd);
+        assert(close(inverse_fd) == 0);
+        inverse_fd = -1;
+
+        std::istringstream standard_in(expected_wire);
+        mapped.deserialize_packed_graph(standard_in, 64);
+        assert(handlegraph::algorithms::are_equivalent_with_paths(&ordinary, &mapped, true));
+
+        PackedGraph ordinary_reloaded;
+        std::istringstream ordinary_in(expected_wire);
+        ordinary_reloaded.deserialize(ordinary_in);
+        assert(path_order(mapped) == path_order(ordinary_reloaded));
+
+        std::ostringstream mapped_out;
+        mapped.serialize_packed_graph(mapped_out, 64);
+        assert(mapped_out.str() == expected_wire);
+
+        mapped.checkpoint_and_evict();
+        assert(path_order(mapped) == path_order(ordinary_reloaded));
+
+        auto mutate_after_load = [](auto& graph) {
+            const handle_t h5000 = graph.create_handle("CCA", 5000);
+            graph.create_edge(graph.get_handle(1000), h5000);
+            const path_handle_t path = graph.create_path_handle("after-load");
+            graph.append_step(path, graph.flip(h5000));
+            graph.append_step(path, graph.get_handle(10));
+            graph.destroy_path(graph.get_path_handle("empty4"));
+        };
+        mutate_after_load(ordinary_reloaded);
+        mutate_after_load(mapped);
+
+        std::ostringstream expected_mutated;
+        ordinary_reloaded.serialize(expected_mutated);
+        std::ostringstream mapped_mutated;
+        mapped.serialize_packed_graph(mapped_mutated, 64);
+        assert(mapped_mutated.str() == expected_mutated.str());
+    }
+    unlink(inverse_filename);
+
+    // A caller-selected initial arena is a sparse logical reservation. It
+    // must not preallocate the corresponding disk blocks.
+    char reserve_filename[] = "mapped-reserveXXXXXX";
+    int reserve_fd = mkstemp(reserve_filename);
+    assert(reserve_fd != -1);
+    constexpr size_t reserve_bytes = 16ull * 1024 * 1024;
+    {
+        MappedPackedGraph reserved(reserve_fd, reserve_bytes);
+        assert(close(reserve_fd) == 0);
+        reserve_fd = -1;
+
+        struct stat arena_stat;
+        assert(stat(reserve_filename, &arena_stat) == 0);
+        assert(static_cast<uint64_t>(arena_stat.st_size) == reserve_bytes);
+        assert(static_cast<uint64_t>(arena_stat.st_blocks) * 512 < reserve_bytes / 4);
+
+        populate_wire_fixture(reserved);
+        std::ostringstream reserved_out;
+        reserved.serialize_packed_graph(reserved_out, 64);
+        assert(reserved_out.str() == expected_wire);
+    }
+    unlink(reserve_filename);
+
+    char small_reserve_filename[] = "mapped-small-reserveXXXXXX";
+    int small_reserve_fd = mkstemp(small_reserve_filename);
+    assert(small_reserve_fd != -1);
+    bool small_reserve_rejected = false;
+    try {
+        MappedPackedGraph invalid(small_reserve_fd, 512);
+    } catch (const std::invalid_argument&) {
+        small_reserve_rejected = true;
+    }
+    assert(small_reserve_rejected);
+    assert(close(small_reserve_fd) == 0);
+    unlink(small_reserve_filename);
+
+    if (std::numeric_limits<size_t>::max() >
+        static_cast<uintmax_t>(std::numeric_limits<::off_t>::max())) {
+        char overflow_reserve_filename[] = "mapped-overflow-reserveXXXXXX";
+        int overflow_reserve_fd = mkstemp(overflow_reserve_filename);
+        assert(overflow_reserve_fd != -1);
+        bool overflow_reserve_rejected = false;
+        try {
+            MappedPackedGraph invalid(overflow_reserve_fd,
+                                      std::numeric_limits<size_t>::max());
+        } catch (const std::overflow_error&) {
+            overflow_reserve_rejected = true;
+        }
+        assert(overflow_reserve_rejected);
+        assert(close(overflow_reserve_fd) == 0);
+        unlink(overflow_reserve_filename);
+    }
+
+    auto malformed_standard_rejected = [&](const string& wire) {
+        char malformed_filename[] = "mapped-malformedXXXXXX";
+        int malformed_fd = mkstemp(malformed_filename);
+        assert(malformed_fd != -1);
+        bool rejected = false;
+        {
+            MappedPackedGraph mapped(malformed_fd);
+            assert(close(malformed_fd) == 0);
+            std::istringstream input(wire);
+            try {
+                mapped.deserialize_packed_graph(input, 64);
+            } catch (const std::exception&) {
+                rejected = true;
+            }
+        }
+        unlink(malformed_filename);
+        return rejected;
+    };
+
+    string wrong_magic = expected_wire;
+    wrong_magic[0] ^= 0x1;
+    assert(malformed_standard_rejected(wrong_magic));
+    assert(malformed_standard_rejected(expected_wire.substr(0, expected_wire.size() - 1)));
+
+    string invalid_width = expected_wire;
+    const size_t graph_anchors_width = sizeof(uint32_t) + 2 * sizeof(nid_t) +
+        3 * sizeof(size_t) + sizeof(uint64_t);
+    assert(graph_anchors_width < invalid_width.size());
+    invalid_width[graph_anchors_width] = 0;
+    assert(malformed_standard_rejected(invalid_width));
+
+    {
+        MappedPackedGraph anonymous;
+        bool rejected = false;
+        try {
+            anonymous.checkpoint_and_evict();
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        assert(rejected);
+
+        std::istringstream standard_in(expected_wire);
+        rejected = false;
+        try {
+            anonymous.deserialize_packed_graph(standard_in, 64);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        assert(rejected);
+        assert(standard_in.tellg() == std::streampos(0));
+    }
+
+    char wrong_prefix_filename[] = "mapped-wrong-prefixXXXXXX";
+    int wrong_prefix_fd = mkstemp(wrong_prefix_filename);
+    assert(wrong_prefix_fd != -1);
+    assert(ftruncate(wrong_prefix_fd, 4096) == 0);
+    const size_t links_before_wrong_prefix = yomo::Manager::count_links();
+    {
+        MappedPackedGraph wrong_prefix_graph;
+        assert(yomo::Manager::count_links() > links_before_wrong_prefix);
+        bool rejected = false;
+        try {
+            wrong_prefix_graph.deserialize(wrong_prefix_fd);
+        } catch (const std::runtime_error& e) {
+            rejected = std::string(e.what()) ==
+                "Expected prefix not found in file. Check file type.";
+        }
+        assert(rejected);
+        assert(yomo::Manager::count_links() == links_before_wrong_prefix);
+    }
+    assert(yomo::Manager::count_links() == links_before_wrong_prefix);
+    assert(close(wrong_prefix_fd) == 0);
+    unlink(wrong_prefix_filename);
 
     char filename[] = "tmpXXXXXX";
     int fd = mkstemp(filename);

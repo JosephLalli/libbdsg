@@ -14,6 +14,8 @@
 #include <iostream>
 #include <functional>
 #include <limits>
+#include <new>
+#include <type_traits>
 
 #include <map>
 #include <unordered_map>
@@ -206,7 +208,15 @@ public:
      *
      * The entire file will be mapped in one contiguous link.
      */
-    static chainid_t create_chain(int fd, const std::string& prefix = "");
+    static chainid_t create_chain(int fd, const std::string& prefix = "",
+                                  size_t initial_size = 0);
+
+    /**
+     * Truncate the given file and create a new file-backed chain in it.
+     * The caller must have exclusive control of the file.
+     */
+    static chainid_t create_empty_chain(int fd, const std::string& prefix = "",
+                                        size_t initial_size = 0);
     
     /**
      * Create a chain by calling the given function until it returns an empty
@@ -361,6 +371,17 @@ public:
      * region's start address and length, in order.
      */
     static void scan_chain(chainid_t chain, const std::function<void(const void*, size_t)>& iteratee);
+
+    /**
+     * Synchronize every mapping in a file-backed chain and then advise the
+     * kernel that its resident pages may be discarded. The chain remains
+     * mapped and usable; later access faults pages back in from the file.
+     *
+     * The caller must ensure that no thread is mutating the chain while this
+     * operation runs. Throws if the chain is anonymous or if a system call
+     * fails.
+     */
+    static void checkpoint_and_evict(chainid_t chain);
     
     /**
      * Dump information about free and allocated memory in the given chain.
@@ -713,6 +734,14 @@ public:
     void construct(const std::string& prefix);
 
     /**
+     * Make a new default-constructed T directly in a newly truncated,
+     * file-backed chain. This avoids relocating non-relative subobjects from
+     * a temporary anonymous arena.
+     */
+    void construct_in_fd(int fd, const std::string& prefix,
+                         size_t initial_size = 0);
+
+    /**
      * Make a new constructed T in memory, preceeded by the given
      * prefix. Forward other arguments to the constructor.
      *
@@ -791,6 +820,12 @@ public:
      * or make a syscall with similar effect, before returning.
      */
     void preload(bool blocking = false) const;
+
+    /**
+     * Synchronize a file-backed chain and release its resident pages. Throws
+     * if this pointer owns anonymous memory.
+     */
+    void checkpoint_and_evict() const;
     
     /**
      * Free any associated memory and become empty.
@@ -850,6 +885,14 @@ public:
     size_t size() const;
     size_t capacity() const;
     void resize(size_t new_size);
+
+    /**
+     * Resize storage for direct overwrite without touching each new element.
+     * This is only available for trivial types; every byte must be initialized
+     * by the caller before it is read.
+     */
+    void resize_for_overwrite(size_t new_size);
+
     void reserve(size_t new_reserved_length);
     void shrink_to_fit();
     
@@ -901,7 +944,7 @@ public:
      * Serialize the data to the given stream.
      */
     void serialize(std::ostream& out) const;
-    
+
     /**
      * Load the data from the given stream.
      */
@@ -1115,6 +1158,24 @@ public:
      * Serialize the data to the given stream.
      */
     void serialize(std::ostream& out) const;
+
+    /**
+     * Serialize in sdsl::int_vector<0> wire format without materializing an
+     * sdsl vector. Writes at most max_chunk_bytes of packed payload per write
+     * and reports each successful write to progress.
+     */
+    size_t serialize_sdsl(std::ostream& out,
+                          size_t max_chunk_bytes,
+                          const std::function<void(size_t)>& progress = {}) const;
+
+    /**
+     * Load sdsl::int_vector<0> wire data directly into this vector. Packed
+     * words are read in bounded chunks and successful reads are reported to
+     * progress. Rejects invalid widths, lengths, padding, and short input.
+     */
+    size_t load_sdsl(std::istream& in,
+                     size_t max_chunk_bytes,
+                     const std::function<void(size_t)>& progress = {});
     
     /**
      * Load the data from the given stream.
@@ -1361,6 +1422,10 @@ void CompatVector<T, Alloc>::reserve(size_t new_reserved_length) {
         << (intptr_t) old_first << " to have " << new_reserved_length  << " spaces" << std::endl;
 #endif
 
+    if (new_reserved_length > std::numeric_limits<size_t>::max() / sizeof(T)) {
+        throw std::length_error("CompatVector allocation size overflow");
+    }
+
     if (new_reserved_length > old_reserved_length) {
         // Allocate space for the new data, and get the position in the context
         T* new_first  = alloc.allocate(new_reserved_length);
@@ -1399,6 +1464,20 @@ void CompatVector<T, Alloc>::reserve(size_t new_reserved_length) {
     }
     
     // If it isn't growing, ignore it.
+}
+
+template<typename T, typename Alloc>
+void CompatVector<T, Alloc>::resize_for_overwrite(size_t new_size) {
+    static_assert(std::is_trivially_default_constructible<T>::value,
+                  "resize_for_overwrite requires a trivially default-constructible type");
+    static_assert(std::is_trivially_destructible<T>::value,
+                  "resize_for_overwrite requires a trivially destructible type");
+
+    clear();
+    if (new_size != 0) {
+        reserve(new_size);
+    }
+    length = new_size;
 }
 
 template<typename T, typename Alloc>
@@ -1704,6 +1783,9 @@ size_t CompatIntVector<Alloc>::size() const {
 
 template<typename Alloc>
 void CompatIntVector<Alloc>::resize(size_t new_size) {
+    if (width() == 0 || new_size > std::numeric_limits<size_t>::max() / width()) {
+        throw std::length_error("Integer-vector bit length overflow");
+    }
     // Work how many slots we need in the backing vector for this, rounding up.
     size_t item_slots = (new_size * width() + (std::numeric_limits<size_t>::digits - 1)) /
         std::numeric_limits<uint64_t>::digits;
@@ -1726,6 +1808,9 @@ size_t CompatIntVector<Alloc>::capacity() const {
 
 template<typename Alloc>
 void CompatIntVector<Alloc>::reserve(size_t new_reserved_length) {
+    if (width() == 0 || new_reserved_length > std::numeric_limits<size_t>::max() / width()) {
+        throw std::length_error("Integer-vector reserve bit length overflow");
+    }
     // Work how many slots we need in the backing vector for this, rounding up.
     size_t item_slots = (new_reserved_length * width() + (std::numeric_limits<uint64_t>::digits - 1)) /
         std::numeric_limits<uint64_t>::digits;
@@ -1896,6 +1981,147 @@ void CompatIntVector<Alloc>::serialize(std::ostream& out) const {
 }
 
 template<typename Alloc>
+size_t CompatIntVector<Alloc>::serialize_sdsl(
+    std::ostream& out,
+    size_t max_chunk_bytes,
+    const std::function<void(size_t)>& progress) const {
+
+    if (bit_width == 0 || bit_width > std::numeric_limits<uint64_t>::digits) {
+        throw std::runtime_error("Cannot serialize invalid integer-vector width " +
+                                 std::to_string(bit_width));
+    }
+    if (max_chunk_bytes < sizeof(uint64_t)) {
+        throw std::invalid_argument("SDSL serialization chunks must be at least one 64-bit word");
+    }
+    if (length > std::numeric_limits<uint64_t>::max() / bit_width) {
+        throw std::overflow_error("Integer-vector bit length overflows the SDSL wire format");
+    }
+
+    const uint64_t bit_size = static_cast<uint64_t>(length) * bit_width;
+    const uint8_t wire_width = static_cast<uint8_t>(bit_width);
+    const uint64_t wire_word_count = bit_size / 64 + ((bit_size & 63) != 0);
+    if (wire_word_count > std::numeric_limits<size_t>::max()) {
+        throw std::overflow_error("Integer-vector word count exceeds addressable memory");
+    }
+    const size_t word_count = static_cast<size_t>(wire_word_count);
+    if (data.size() != word_count) {
+        throw std::runtime_error("Integer-vector packed storage length is inconsistent");
+    }
+
+    size_t written = 0;
+    auto write_bytes = [&](const void* source, size_t bytes) {
+        out.write(static_cast<const char*>(source), static_cast<std::streamsize>(bytes));
+        if (!out) {
+            throw std::runtime_error("Error writing SDSL integer-vector data");
+        }
+        written += bytes;
+        if (progress) {
+            progress(bytes);
+        }
+    };
+
+    write_bytes(&bit_size, sizeof(bit_size));
+    write_bytes(&wire_width, sizeof(wire_width));
+
+    const bool has_partial_word = (bit_size & 63) != 0;
+    const size_t direct_words = word_count - (has_partial_word ? 1 : 0);
+    const size_t stream_word_limit =
+        static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) / sizeof(uint64_t);
+    const size_t words_per_chunk = std::max<size_t>(
+        1, std::min(max_chunk_bytes / sizeof(uint64_t), stream_word_limit));
+    const uint64_t* words = data.get_first();
+    for (size_t offset = 0; offset < direct_words;) {
+        const size_t chunk_words = std::min(words_per_chunk, direct_words - offset);
+        write_bytes(words + offset, chunk_words * sizeof(uint64_t));
+        offset += chunk_words;
+    }
+
+    if (has_partial_word) {
+        const uint8_t used_bits = static_cast<uint8_t>(bit_size & 63);
+        const uint64_t final_word = words[word_count - 1] & sdsl::bits::lo_set[used_bits];
+        write_bytes(&final_word, sizeof(final_word));
+    }
+
+    return written;
+}
+
+template<typename Alloc>
+size_t CompatIntVector<Alloc>::load_sdsl(
+    std::istream& in,
+    size_t max_chunk_bytes,
+    const std::function<void(size_t)>& progress) {
+
+    if (max_chunk_bytes < sizeof(uint64_t)) {
+        throw std::invalid_argument("SDSL deserialization chunks must be at least one 64-bit word");
+    }
+
+    size_t read = 0;
+    auto read_bytes = [&](void* destination, size_t bytes) {
+        if (bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max())) {
+            throw std::overflow_error("SDSL input read exceeds streamsize");
+        }
+        in.read(static_cast<char*>(destination), static_cast<std::streamsize>(bytes));
+        if (static_cast<size_t>(in.gcount()) != bytes) {
+            throw std::runtime_error("Truncated SDSL integer-vector data");
+        }
+        if (read > std::numeric_limits<size_t>::max() - bytes) {
+            throw std::overflow_error("SDSL input byte count overflow");
+        }
+        read += bytes;
+        if (progress) {
+            progress(bytes);
+        }
+    };
+
+    uint64_t wire_bit_size = 0;
+    uint8_t wire_width = 0;
+    read_bytes(&wire_bit_size, sizeof(wire_bit_size));
+    read_bytes(&wire_width, sizeof(wire_width));
+
+    if (wire_width == 0 || wire_width > std::numeric_limits<uint64_t>::digits) {
+        throw std::runtime_error("Invalid SDSL integer-vector width " +
+                                 std::to_string(wire_width));
+    }
+    if (wire_bit_size % wire_width != 0) {
+        throw std::runtime_error("SDSL integer-vector bit length is not divisible by its width");
+    }
+
+    const uint64_t wire_length = wire_bit_size / wire_width;
+    const uint64_t wire_word_count = wire_bit_size / 64 + ((wire_bit_size & 63) != 0);
+    if (wire_length > std::numeric_limits<size_t>::max() ||
+        wire_word_count > std::numeric_limits<size_t>::max() ||
+        wire_word_count > std::numeric_limits<size_t>::max() / sizeof(uint64_t)) {
+        throw std::overflow_error("SDSL integer-vector dimensions exceed addressable storage");
+    }
+
+    clear();
+    bit_width = wire_width;
+    const size_t word_count = static_cast<size_t>(wire_word_count);
+    data.resize_for_overwrite(word_count);
+
+    const size_t stream_word_limit =
+        static_cast<size_t>(std::numeric_limits<std::streamsize>::max()) / sizeof(uint64_t);
+    const size_t words_per_chunk = std::max<size_t>(
+        1, std::min(max_chunk_bytes / sizeof(uint64_t), stream_word_limit));
+    uint64_t* words = data.get_first();
+    for (size_t offset = 0; offset < word_count;) {
+        const size_t chunk_words = std::min(words_per_chunk, word_count - offset);
+        read_bytes(words + offset, chunk_words * sizeof(uint64_t));
+        offset += chunk_words;
+    }
+
+    if (word_count != 0 && (wire_bit_size & 63) != 0) {
+        const uint8_t used_bits = static_cast<uint8_t>(wire_bit_size & 63);
+        if ((words[word_count - 1] & ~sdsl::bits::lo_set[used_bits]) != 0) {
+            throw std::runtime_error("SDSL integer-vector has nonzero tail padding");
+        }
+    }
+
+    length = static_cast<size_t>(wire_length);
+    return read;
+}
+
+template<typename Alloc>
 void CompatIntVector<Alloc>::load(std::istream& in) {
     // Read the length
     in.read((char*)&length, sizeof(length));
@@ -2017,6 +2243,9 @@ bool Allocator<T>::operator!=(const Allocator& other) const {
 
 template<typename T>
 auto Allocator<T>::allocate(size_type n, const T* hint) -> T* {
+    if (n > max_size()) {
+        throw std::bad_array_new_length();
+    }
     auto our_chain = get_chain();
     T* allocated = (T*) Manager::allocate_from(our_chain, n * sizeof(T));
     if (yomo::Manager::check_chains) {
@@ -2033,9 +2262,7 @@ void Allocator<T>::deallocate(T* p, size_type n) {
 
 template<typename T>
 size_t Allocator<T>::max_size() const {
-    // TODO: this probably won't really fit in memory, but other than that
-    // there's no reason we can't allocate something this big.
-    return numeric_limits<size_t>::max();
+    return numeric_limits<size_t>::max() / sizeof(T);
 }
 
 template<typename T>
@@ -2123,6 +2350,23 @@ template<typename T>
 void UniqueMappedPointer<T>::construct(const std::string& prefix) {
     // Use the provided prefix.
     construct_internal(prefix);
+}
+
+template<typename T>
+void UniqueMappedPointer<T>::construct_in_fd(int fd, const std::string& prefix,
+                                             size_t initial_size) {
+    reset();
+    chain = Manager::create_empty_chain(fd, prefix, initial_size);
+    try {
+        T* item = static_cast<T*>(Manager::allocate_from(chain, sizeof(T)));
+        new (item) T();
+        cached_value = item;
+    } catch (...) {
+        Manager::destroy_chain(chain);
+        chain = Manager::NO_CHAIN;
+        cached_value = nullptr;
+        throw;
+    }
 }
 
 template<typename T>
@@ -2300,6 +2544,14 @@ void UniqueMappedPointer<T>::preload(bool blocking) const {
     if (chain != Manager::NO_CHAIN) {
         Manager::preload_chain(chain, blocking);
     }
+}
+
+template<typename T>
+void UniqueMappedPointer<T>::checkpoint_and_evict() const {
+    if (chain == Manager::NO_CHAIN) {
+        throw std::runtime_error("Cannot checkpoint a null mapped object");
+    }
+    Manager::checkpoint_and_evict(chain);
 }
 
 template<typename T>
