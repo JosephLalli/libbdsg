@@ -1652,9 +1652,30 @@ public:
             vector<pair<temp_record_t, size_t>> children; 
             //The ranks & orientations of children that are tips
             unordered_map<size_t, bool> tippy_child_ranks; 
-            //vector<tuple<pair<size_t, bool>, pair<size_t, bool>, size_t>> distances;
-            unordered_map<pair<pair<size_t, bool>, pair<size_t, bool>>, size_t> distances;
-                     
+            //Distances between internal child sides, staged in the layout of the finished
+            //record's distance vector (SnarlRecord::get_distance_vector_offset), so each
+            //unordered pair of sides has one slot. An entry is distance+1, 0 if unset, or
+            //STAGED_DISTANCE_OVERFLOW if the distance does not fit and is in distance_overflow.
+            //A dense array costs 4 bytes per slot; the hash map it replaces reserved a bucket
+            //per slot and allocated a node per stored distance. get_snarl_tree_records
+            //releases it once copied, hence mutable.
+            mutable vector<uint32_t> distances;
+            mutable unordered_map<size_t, size_t> distance_overflow;
+            static const uint32_t STAGED_DISTANCE_OVERFLOW = std::numeric_limits<uint32_t>::max();
+
+            //Size the staging array for the distance vector of a snarl with node_count children
+            void allocate_staged_distances();
+            //Slot of the distance between two child sides in the staging array
+            size_t staged_distance_offset(size_t rank1, bool right_side1, size_t rank2, bool right_side2) const;
+            //Stage a distance in an empty slot. Returns false if the slot already held a
+            //different distance, which it keeps.
+            bool stage_distance(size_t offset, size_t distance);
+            //Call iteratee(rank1, right_side1, rank2, right_side2, distance) for every staged
+            //distance, in slot order
+            void for_each_staged_distance(const std::function<void(size_t, bool, size_t, bool, size_t)>& iteratee) const;
+            //Free the staging storage
+            void release_staged_distances() const;
+
             //How long is the record going to be in the distance index?
             size_t get_max_record_length() const ;
         };
@@ -1691,6 +1712,9 @@ public:
         vector<TemporaryNodeRecord> temp_node_records;
         bool use_oversized_snarls = false;
         size_t most_oversized_snarl_size = 0;
+        //How many times a traversal found a distance for a pair of child sides that
+        //disagreed with the distance another traversal had already staged for that pair
+        size_t staged_distance_conflicts = 0;
         friend class SnarlDistanceIndex;
 
     };

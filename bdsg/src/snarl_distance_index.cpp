@@ -107,6 +107,61 @@ size_t SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::get_max
     }
 }
 
+void SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::allocate_staged_distances() {
+    distances.assign(SnarlRecord::distance_vector_size(is_root_snarl ? DISTANCED_ROOT_SNARL : DISTANCED_SNARL,
+                                                       node_count), 0);
+    distance_overflow.clear();
+}
+
+size_t SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::staged_distance_offset(size_t rank1, bool right_side1,
+        size_t rank2, bool right_side2) const {
+    return SnarlRecord::get_distance_vector_offset(rank1, right_side1, rank2, right_side2, node_count,
+                                                   is_root_snarl ? DISTANCED_ROOT_SNARL : DISTANCED_SNARL);
+}
+
+bool SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::stage_distance(size_t offset, size_t distance) {
+    uint32_t& slot = distances.at(offset);
+    if (slot != 0) {
+        size_t staged = slot == STAGED_DISTANCE_OVERFLOW ? distance_overflow.at(offset) : slot - 1;
+        return staged == distance;
+    }
+    if (distance < (size_t) STAGED_DISTANCE_OVERFLOW - 1) {
+        slot = distance + 1;
+    } else {
+        slot = STAGED_DISTANCE_OVERFLOW;
+        distance_overflow[offset] = distance;
+    }
+    return true;
+}
+
+void SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::for_each_staged_distance(
+        const std::function<void(size_t, bool, size_t, bool, size_t)>& iteratee) const {
+    //Slots run through side pairs (side1 <= side2) in this order; see SnarlRecord::get_distance_vector_offset.
+    //Side s is rank s/2 (shifted past the start and end bounds in a non-root snarl) and right side s%2.
+    if (distances.empty()) {
+        //Nothing was staged: distances are not stored, or the snarl is oversized
+        return;
+    }
+    const size_t side_count = node_count * 2;
+    const size_t rank_shift = is_root_snarl ? 0 : 2;
+    size_t offset = 0;
+    for (size_t side1 = 0 ; side1 < side_count ; side1++) {
+        for (size_t side2 = side1 ; side2 < side_count ; side2++, offset++) {
+            uint32_t slot = distances[offset];
+            if (slot != 0) {
+                size_t distance = slot == STAGED_DISTANCE_OVERFLOW ? distance_overflow.at(offset) : slot - 1;
+                iteratee(side1 / 2 + rank_shift, side1 % 2, side2 / 2 + rank_shift, side2 % 2, distance);
+            }
+        }
+    }
+    assert(offset == distances.size());
+}
+
+void SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::release_staged_distances() const {
+    vector<uint32_t>().swap(distances);
+    unordered_map<size_t, size_t>().swap(distance_overflow);
+}
+
 
 
 
@@ -6410,28 +6465,26 @@ void SnarlDistanceIndex::get_snarl_tree_records(const vector<const TemporaryDist
                                 snarl_record_constructor.set_distance_end_end(temp_snarl_record.distance_end_end);
 
                                 //Add distances and record connectivity
-                                for (const auto& it : temp_snarl_record.distances) {
-                                    pair<size_t, size_t> node_rank1 = it.first.first;
-                                    pair<size_t, size_t> node_rank2 = it.first.second;
-                                    const size_t distance = it.second;
+                                if (!ignore_distances) {
+                                    //If we are keeping track of distances
+                                    //If the distance exceeded the limit, then it wasn't found in the first place
+                                    temp_snarl_record.for_each_staged_distance([&](size_t rank1, bool right_side1,
+                                            size_t rank2, bool right_side2, size_t distance) {
+                                        snarl_record_constructor.set_distance(rank1, right_side1, rank2, right_side2, distance);
 
-                                    if (!ignore_distances) {
-                                        //If we are keeping track of distances
-                                        //If the distance exceeded the limit, then it wasn't found in the first place
-                                        snarl_record_constructor.set_distance(node_rank1.first, node_rank1.second,
-                                            node_rank2.first, node_rank2.second, distance);
-
-                                        if (temp_snarl_record.tippy_child_ranks.count(node_rank1.first)
-                                            && temp_snarl_record.tippy_child_ranks.count(node_rank2.first)) {
+                                        if (temp_snarl_record.tippy_child_ranks.count(rank1)
+                                            && temp_snarl_record.tippy_child_ranks.count(rank2)) {
                                             snarl_record_constructor.set_tip_tip_connected();
                                         }
 #ifdef debug_distance_indexing
                                         assert(distance <= temp_snarl_record.max_distance);
-                                        assert(snarl_record_constructor.get_distance(node_rank1.first, node_rank1.second,
-                                               node_rank2.first, node_rank2.second) ==  distance);
+                                        assert(snarl_record_constructor.get_distance(rank1, right_side1,
+                                               rank2, right_side2) ==  distance);
 #endif
-                                    }
+                                    });
                                 }
+                                //The distances are in the record now
+                                temp_snarl_record.release_staged_distances();
                                 //Now set the connectivity of this snarl
                                 if (temp_snarl_record.distance_start_start != std::numeric_limits<size_t>::max()) {
                                     snarl_record_constructor.set_start_start_connected();
@@ -6597,25 +6650,24 @@ void SnarlDistanceIndex::get_snarl_tree_records(const vector<const TemporaryDist
                 if (!ignore_distances ) {
 
 
-                    for (const auto& it : temp_snarl_record.distances) {
-                        const pair<size_t, bool> node_rank1 = it.first.first;
-                        const pair<size_t, bool> node_rank2 = it.first.second;
-                        const size_t distance = it.second;
+                    temp_snarl_record.for_each_staged_distance([&](size_t rank1, bool right_side1,
+                            size_t rank2, bool right_side2, size_t distance) {
                         //If we are keeping track of distances and either this is a small enough snarl,
                         //or the snarl is too big but we are looking at the boundaries
 #ifdef debug_distance_indexing
                         assert(distance <= temp_snarl_record.max_distance);
 #endif
                         if ((temp_snarl_record.node_count <= snarl_size_limit)) {
-                            snarl_record_constructor.set_distance(node_rank1.first, node_rank1.second,
-                             node_rank2.first, node_rank2.second, distance);
+                            snarl_record_constructor.set_distance(rank1, right_side1, rank2, right_side2, distance);
 #ifdef debug_distance_indexing
-                            assert(snarl_record_constructor.get_distance(node_rank1.first, node_rank1.second,
-                                    node_rank2.first, node_rank2.second) == distance);
+                            assert(snarl_record_constructor.get_distance(rank1, right_side1,
+                                    rank2, right_side2) == distance);
 #endif
                         }
-                    }
+                    });
                 }
+                //The distances are in the record now
+                temp_snarl_record.release_staged_distances();
 
 #ifdef debug_distance_indexing
                 cerr << "    The snarl record is at offset " << snarl_record_constructor.record_offset << endl;
