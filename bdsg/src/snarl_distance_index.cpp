@@ -102,7 +102,10 @@ size_t SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord::get_max
          if (parent.first == TEMP_ROOT) {
              return SnarlRecord::record_size(include_distances ? DISTANCED_ROOT_SNARL : ROOT_SNARL, node_count) + node_count;
          } else {
-            return SnarlRecord::record_size(include_distances ? DISTANCED_SNARL : SNARL, node_count) + node_count;
+            //An oversized snarl is written as an OVERSIZED_SNARL record, which has no distance
+            //matrix. (A root snarl is always written with one, so it keeps the full size above.)
+            record_t type = !include_distances ? SNARL : (is_oversized ? OVERSIZED_SNARL : DISTANCED_SNARL);
+            return SnarlRecord::record_size(type, node_count) + node_count;
          }
     }
 }

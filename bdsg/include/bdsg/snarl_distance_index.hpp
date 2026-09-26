@@ -1648,6 +1648,8 @@ public:
             bool is_tip = false;
             bool is_root_snarl = false;
             bool include_distances = true;
+            //More children than the snarl size limit, so no distances between internal children
+            bool is_oversized = false;
             //All children, nodes and chains, in arbitrary order
             vector<pair<temp_record_t, size_t>> children; 
             //The ranks & orientations of children that are tips
