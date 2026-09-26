@@ -6852,7 +6852,17 @@ void SnarlDistanceIndex::get_snarl_tree_records(const vector<const TemporaryDist
     cerr << "Predicted size: " << maximum_index_size << " actual size: " <<  snarl_tree_records->size() << endl;
 #endif
 
-
+    // The records vector was reserved from an estimate and doubles when it outgrows it, and saving
+    // writes out its whole allocation chain: the unused reserved capacity, and any block it outgrew,
+    // along with the records. Rebuild it in a chain allocated to fit before anything saves it.
+    // Copy-constructing a MappedIntVector allocates exactly its size. It takes two copies because
+    // construct() frees the old chain before copying into the new one, and UniqueMappedPointer's
+    // defaulted move would leave both pointers owning the same chain.
+    {
+        bdsg::yomo::UniqueMappedPointer<bdsg::MappedIntVector> fitted;
+        fitted.construct(get_prefix(), *snarl_tree_records);
+        snarl_tree_records.construct(get_prefix(), *fitted);
+    }
 }
 
 
