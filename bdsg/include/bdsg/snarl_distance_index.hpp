@@ -211,6 +211,22 @@ public:
     /// use it.
     void preload(bool blocking = false) const;
 
+    /// Write one index covering several indexes of disjoint graphs to
+    /// output_path, without needing the graphs. Each part is an index file
+    /// and a constant added to all of its node IDs; the shifted ID ranges must
+    /// not overlap, and every part must be a version 4 index. The parts'
+    /// records are copied with only their node IDs, record offsets and
+    /// connected component numbers rewritten, so distances within a part are
+    /// unchanged and parts are unreachable from each other. Part order sets
+    /// the record layout and component numbering; the same parts in the same
+    /// order give the same bytes. Parts are only ever opened read-only, one
+    /// at a time, and the output is built in a file-backed mapping that is
+    /// renamed onto output_path once complete. Progress goes to log if it is
+    /// not null. Throws std::runtime_error naming the part at fault.
+    static void merge_indexes(const std::string& output_path,
+                              const std::vector<std::pair<std::string, handlegraph::nid_t>>& parts,
+                              std::ostream* log = nullptr);
+
 
 ////////////////////////////////////  How we define different properties of a net handle
 
@@ -799,6 +815,10 @@ private:
 
     ///This vector is the entire distance index. It is split up into "records" that are defined below
     bdsg::yomo::UniqueMappedPointer<bdsg::MappedIntVector> snarl_tree_records;
+
+    /// Rewrites and concatenates the records of several indexes for
+    /// merge_indexes(); defined in snarl_distance_index_merge.cpp.
+    class IndexMerger;
 
 /*
  * These are used to interpret snarl_tree_records, which is just a vector of ints.

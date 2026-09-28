@@ -309,6 +309,7 @@ add_library(bdsg_objs OBJECT
   ${bdsg_DIR}/src/utility.cpp
   ${bdsg_DIR}/src/vectorizable_overlays.cpp
   ${bdsg_DIR}/src/snarl_distance_index.cpp
+  ${bdsg_DIR}/src/snarl_distance_index_merge.cpp
   )
 
 # Add includes for ourselves
