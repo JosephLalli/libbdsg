@@ -739,7 +739,92 @@ void test_serializable_handle_graphs() {
   cerr << "SerializableHandleGraph tests successful!" << endl;
 }
 
+template <typename Graph>
+void make_batch_edge_deletion_fixture(Graph *graph, nid_t hub_id, nid_t first_hub_target,
+                                      nid_t last_hub_target) {
+  for (nid_t id = hub_id; id <= last_hub_target; ++id) {
+    graph->create_handle("A", id);
+  }
+  for (nid_t id = first_hub_target; id <= last_hub_target; ++id) {
+    graph->create_edge(graph->get_handle(hub_id), graph->get_handle(id, id % 2));
+  }
+  graph->create_edge(graph->get_handle(last_hub_target - 1), graph->get_handle(last_hub_target));
+  graph->create_edge(graph->get_handle(last_hub_target), graph->get_handle(last_hub_target));
+  auto path = graph->create_path_handle("kept_path");
+  graph->append_step(path, graph->get_handle(last_hub_target - 1));
+  graph->append_step(path, graph->get_handle(last_hub_target));
+}
+
+template <typename Graph>
+void test_batch_edge_deletion() {
+  constexpr nid_t hub_id = 1;
+  constexpr size_t hub_edge_count = 64;
+  constexpr size_t deleted_hub_edge_count = 48;
+  constexpr nid_t first_deleted_hub_target = hub_id + 1;
+  constexpr nid_t first_remaining_hub_target = first_deleted_hub_target + deleted_hub_edge_count;
+  constexpr nid_t last_hub_target = hub_id + hub_edge_count;
+  // The three extra initial edges are an ordinary edge, ordinary self-edge, and reversing self-edge.
+  constexpr size_t initial_edge_count = hub_edge_count + 3;
+  constexpr size_t remaining_edge_count = initial_edge_count - deleted_hub_edge_count - 1;
+
+  Graph graph, expected;
+  make_batch_edge_deletion_fixture(&graph, hub_id, first_deleted_hub_target, last_hub_target);
+  make_batch_edge_deletion_fixture(&expected, hub_id, first_remaining_hub_target, last_hub_target);
+  auto hub = graph.get_handle(hub_id);
+  graph.create_edge(hub, graph.flip(hub));
+  assert(graph.get_edge_count() == initial_edge_count);
+  size_t calls = 0;
+  graph.destroy_edges([&](const auto &emit) {
+    ++calls;
+    for (nid_t id = first_deleted_hub_target; id < first_remaining_hub_target; ++id) {
+      emit(graph.edge_handle(hub, graph.get_handle(id, id % 2)));
+      assert(graph.get_edge_count() == initial_edge_count -
+             (id - first_deleted_hub_target + 1));
+    }
+    emit(graph.edge_handle(hub, graph.flip(hub)));
+    assert(graph.get_edge_count() == remaining_edge_count);
+  });
+  assert(calls == 1);
+  assert(handlegraph::algorithms::are_equivalent_with_paths(&graph, &expected, true));
+  graph.destroy_edges([](const auto &) {});
+  assert(handlegraph::algorithms::are_equivalent_with_paths(&graph, &expected, true));
+  // A single ordinary self-edge has two adjacency records.
+  auto self = graph.get_handle(last_hub_target);
+  graph.destroy_edges([&](const auto &emit) { emit(graph.edge_handle(self, self)); });
+  expected.destroy_edge(expected.get_handle(last_hub_target), expected.get_handle(last_hub_target));
+  assert(handlegraph::algorithms::are_equivalent_with_paths(&graph, &expected, true));
+
+  // A producer failure retains completed deletions and leaves the graph usable.
+  const string expected_producer_failure = "expected producer failure";
+  bool threw = false;
+  try {
+    graph.destroy_edges([&](const auto &emit) {
+      emit(graph.edge_handle(hub, graph.get_handle(first_remaining_hub_target,
+                                                    first_remaining_hub_target % 2)));
+      throw runtime_error(expected_producer_failure);
+    });
+  } catch (const runtime_error &error) {
+    assert(string(error.what()) == expected_producer_failure);
+    threw = true;
+  }
+  assert(threw);
+  expected.destroy_edge(expected.get_handle(hub_id),
+                        expected.get_handle(first_remaining_hub_target,
+                                            first_remaining_hub_target % 2));
+  assert(handlegraph::algorithms::are_equivalent_with_paths(&graph, &expected, true));
+  graph.destroy_edges([&](const auto &emit) {
+    emit(graph.edge_handle(hub, graph.get_handle(first_remaining_hub_target + 1,
+                                                 (first_remaining_hub_target + 1) % 2)));
+  });
+  expected.destroy_edge(expected.get_handle(hub_id),
+                        expected.get_handle(first_remaining_hub_target + 1,
+                                            (first_remaining_hub_target + 1) % 2));
+  assert(handlegraph::algorithms::are_equivalent_with_paths(&graph, &expected, true));
+}
+
 void test_deletable_handle_graphs() {
+  test_batch_edge_deletion<PackedGraph>();
+  test_batch_edge_deletion<MappedPackedGraph>();
 
   // first batch of tests
   {
