@@ -341,6 +341,11 @@ public:
     /// Output contents to a stream
     void serialize(ostream& out) const;
     
+    /// Serialize replayable values page by page in the ordinary representation.
+    /// The first page retains PackedVector layout; later pages retain their anchors.
+    template<class Generator>
+    static void serialize_generated(ostream& out, size_t count, Generator&& generate);
+
     /// Set the i-th value
     inline void set(const size_t& i, const uint64_t& value);
     
@@ -1552,6 +1557,116 @@ template<size_t page_size, typename Backend>
 void RobustPagedVector<page_size, Backend>::serialize(ostream& out) const {
     first_page.serialize(out);
     latter_pages.serialize(out);
+}
+
+template<size_t page_size, typename Backend>
+template<class Generator>
+void RobustPagedVector<page_size, Backend>::serialize_generated(
+    ostream& out, size_t count, Generator&& generate) {
+    static_assert(std::is_same<Backend, STLBackend>::value,
+                  "Generated RobustPagedVector serialization requires STLBackend");
+    const size_t first_count = std::min(count, page_size);
+    PackedVector<STLBackend> generated_first;
+    PackedVector<STLBackend> generated_anchors;
+    size_t generated_count = 0;
+    generate([&](uint64_t value) {
+        if (generated_count == count) {
+            throw std::length_error("Generated RobustPagedVector emitted too many values");
+        }
+        if (generated_count < first_count) {
+            // A PackedVector's final wire state depends on its append count,
+            // maximum width and final values. Later set() calls do not alter
+            // capacity; emitting the final values reproduces that state.
+            generated_first.push_back(value);
+        } else {
+            const size_t latter = generated_count - first_count;
+            if (latter % page_size == 0) {
+                generated_anchors.push_back(0);
+            }
+            const size_t page = latter / page_size;
+            if (generated_anchors.get(page) == 0) {
+                generated_anchors.set(page, value);
+            }
+        }
+        ++generated_count;
+    });
+    if (generated_count != count) {
+        throw std::length_error("Generated RobustPagedVector emitted too few values");
+    }
+    generated_first.serialize(out);
+    if (!out) {
+        throw std::runtime_error("Error writing generated RobustPagedVector first page");
+    }
+
+    const size_t latter_count = count - first_count;
+    sdsl::write_member(latter_count, out);
+    sdsl::write_member(page_size, out);
+    generated_anchors.serialize(out);
+    if (!out) {
+        throw std::runtime_error("Error writing generated RobustPagedVector latter header");
+    }
+
+    PackedVector<STLBackend> scratch;
+    if (latter_count != 0) {
+        scratch.resize(page_size);
+    }
+    size_t replayed = 0;
+    size_t latter_replayed = 0;
+    size_t serialized_pages = 0;
+    size_t page_filled = 0;
+    uint64_t observed_anchor = 0;
+    auto to_page_diff = [](uint64_t value, uint64_t anchor) {
+        if (value == 0) {
+            return uint64_t(0);
+        }
+        if (value >= anchor) {
+            const uint64_t raw_diff = value - anchor;
+            return raw_diff + raw_diff / 4 + 1;
+        }
+        return uint64_t(5) * (anchor - value);
+    };
+    auto serialize_page = [&]() {
+        if (page_filled == 0 || serialized_pages >= generated_anchors.size() ||
+            observed_anchor != generated_anchors.get(serialized_pages)) {
+            throw std::invalid_argument("Generated RobustPagedVector changed between passes");
+        }
+        scratch.serialize(out);
+        if (!out) {
+            throw std::runtime_error("Error writing generated RobustPagedVector page");
+        }
+        ++serialized_pages;
+        scratch.clear();
+        page_filled = 0;
+        observed_anchor = 0;
+        if (serialized_pages < generated_anchors.size()) {
+            scratch.resize(page_size);
+        }
+    };
+    generate([&](uint64_t value) {
+        if (replayed == count) {
+            throw std::length_error("Generated RobustPagedVector replay emitted too many values");
+        }
+        if (replayed++ >= first_count) {
+            if (observed_anchor == 0) {
+                observed_anchor = value;
+            }
+            scratch.set(page_filled, to_page_diff(value, observed_anchor));
+            ++page_filled;
+            ++latter_replayed;
+            if (page_filled == page_size) {
+                serialize_page();
+            }
+        }
+    });
+    if (replayed != count || latter_replayed != latter_count) {
+        throw std::length_error("Generated RobustPagedVector replay emitted too few values");
+    }
+    if (page_filled != 0) {
+        serialize_page();
+    }
+    if (serialized_pages != generated_anchors.size()) {
+        throw std::logic_error("Generated RobustPagedVector page count is inconsistent");
+    }
 }
 
 template<size_t page_size, typename Backend>

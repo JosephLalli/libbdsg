@@ -1250,7 +1250,7 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     // Count every path before starting workers or writing output. The resulting
     // prefix supplies stable global membership offsets to all later replays.
     vector<size_t> prefix(path_count + 1, 0);
-    size_t total_steps = 0;
+    size_t total_steps = 0, longest_path = 0;
     for (size_t i = 0; i < path_count; ++i) {
         const size_t count = path_size(i);
         if (count > maximum / PATH_RECORD_SIZE) {
@@ -1260,6 +1260,7 @@ void BasePackedGraph<Backend>::serialize_with_paths(
             throw std::overflow_error("Generated path membership count overflow");
         }
         total_steps += count;
+        longest_path = std::max(longest_path, count);
         prefix[i + 1] = total_steps;
     }
 
@@ -1382,6 +1383,16 @@ void BasePackedGraph<Backend>::serialize_with_paths(
         id_offsets = section_offsets(WIDE_PAGE_WIDTH);
         rank_offsets = section_offsets(NARROW_PAGE_WIDTH);
     }
+
+    // Parallel local records retain their anchors, one page of scratch per
+    // worker, bounded output chunks, and path-sized batch indexes. Serial local
+    // replay uses one such record directly when the extra plan cannot fit.
+    const size_t local_anchor_pages = ceiling_divide(longest_path * PATH_RECORD_SIZE, NARROW_PAGE_WIDTH);
+    size_t local_bytes = saturated_add(prefix_bytes, saturated_multiply(
+        active_workers, saturated_add(size_t(64) << 10, saturated_multiply(local_anchor_pages, size_t(16)))));
+    local_bytes = saturated_add(local_bytes, saturated_multiply(3 * active_workers + 2, chunk_bytes + 512));
+    const size_t local_plan = saturated_add(planned_bytes, local_bytes);
+    const bool parallel_local = local_plan != maximum && local_plan <= extra_memory_budget;
 
     // Path metadata mutation stays ordered because its packed-vector mutation
     // history is part of the ordinary PackedGraph byte representation.
@@ -1599,27 +1610,62 @@ void BasePackedGraph<Backend>::serialize_with_paths(
         previous.links_iv.serialize(out);
         previous.steps_iv.serialize(out);
     }
-    for (size_t i = 0; i < path_count; ++i) {
-        PackedPath local;
+    auto write_local_path = [&](size_t i, ostream& destination) {
         const size_t count = prefix[i + 1] - prefix[i];
-        size_t visited = 0;
-        path_steps(i, [&](const handle_t& handle) {
-            if (visited == count) {
-                throw std::invalid_argument("Generated local path has too many steps");
+        auto generate_links = [&](const auto& emit) {
+            for (size_t rank = 0; rank < count; ++rank) {
+                emit(rank == 0 ? 0 : rank);
+                emit(rank + 1 == count ? 0 : rank + 2);
             }
-            local.steps_iv.push_back(as_integer(handle));
-            local.links_iv.push_back(visited);
-            local.links_iv.push_back(0);
-            if (visited != 0) {
-                metadata.set_step_next(local, visited, visited + 1);
+        };
+        RobustPagedVector<NARROW_PAGE_WIDTH>::serialize_generated(
+            destination, count * PATH_RECORD_SIZE, generate_links);
+        auto generate_steps = [&](const auto& emit) {
+            size_t visited = 0;
+            path_steps(i, [&](const handle_t& handle) {
+                if (visited == count) {
+                    throw std::invalid_argument("Generated local path has too many steps");
+                }
+                if (!has_node(get_id(handle))) {
+                    throw std::invalid_argument("Generated local path visits a missing node");
+                }
+                emit(as_integer(handle));
+                ++visited;
+            });
+            if (visited != count) {
+                throw std::invalid_argument("Generated local path has too few steps");
             }
-            ++visited;
-        });
-        if (visited != count) {
-            throw std::invalid_argument("Generated local path has too few steps");
+        };
+        RobustPagedVector<NARROW_PAGE_WIDTH>::serialize_generated(destination, count, generate_steps);
+    };
+    if (parallel_local) {
+        // Small path batches avoid queue synchronization for every short path.
+        // A long path remains one block and streams through bounded chunks.
+        vector<size_t> local_bounds{0};
+        local_bounds.reserve(path_count + 1);
+        constexpr size_t step_limit = 8192, path_limit = 128;
+        size_t local_steps = 0;
+        for (size_t i = 0; i < path_count; ++i) {
+            const size_t count = prefix[i + 1] - prefix[i];
+            if (i != local_bounds.back() &&
+                (i - local_bounds.back() == path_limit ||
+                 count > step_limit - std::min(local_steps, step_limit))) {
+                local_bounds.push_back(i);
+                local_steps = 0;
+            }
+            local_steps = saturated_add(local_steps, count);
         }
-        local.links_iv.serialize(out);
-        local.steps_iv.serialize(out);
+        local_bounds.push_back(path_count);
+        internal::bounded_ordered_output(out, local_bounds.size() - 1, active_workers, chunk_bytes,
+            [&](size_t block, ostream& block_out) {
+                for (size_t i = local_bounds[block]; i < local_bounds[block + 1]; ++i) {
+                    write_local_path(i, block_out);
+                }
+            });
+    } else {
+        for (size_t i = 0; i < path_count; ++i) {
+            write_local_path(i, out);
+        }
     }
     sdsl::write_member(deleted_node_records, out);
     sdsl::write_member(deleted_edge_records, out);
