@@ -8,6 +8,7 @@
 #ifndef BDSG_BASE_PACKED_GRAPH_HPP_INCLUDED
 #define BDSG_BASE_PACKED_GRAPH_HPP_INCLUDED
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <string>
@@ -22,6 +23,7 @@
 #include "bdsg/internal/hash_map.hpp"
 #include "bdsg/internal/utility.hpp"
 #include "bdsg/internal/eades_algorithm.hpp"
+#include "bdsg/internal/bounded_parallel.hpp"
 #include "bdsg/graph_proxy.hpp"
 
 #include <arpa/inet.h>
@@ -87,6 +89,18 @@ public:
     void serialize_with_paths(ostream& out, size_t path_count,
                               const PathName& path_name, const PathSize& path_size,
                               const PathSteps& path_steps) const;
+
+    /**
+     * Generate replayable paths with bounded parallel preflight. The path
+     * producer must be safe to replay concurrently. If the plan cannot fit
+     * within `extra_memory_budget`, output falls back to the serial overload
+     * before writing any bytes.
+     */
+    template<class PathName, class PathSize, class PathSteps>
+    void serialize_with_paths(ostream& out, size_t path_count,
+                              const PathName& path_name, const PathSize& path_size,
+                              const PathSteps& path_steps, size_t workers,
+                              size_t extra_memory_budget) const;
     
 private:
     
@@ -1193,6 +1207,353 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     sdsl::write_member(reversing_self_edge_records, out);
     sdsl::write_member(deleted_reversing_self_edge_records, out);
     if (!out) { throw std::runtime_error("Could not write generated PackedGraph paths"); }
+}
+
+template<typename Backend>
+template<class PathName, class PathSize, class PathSteps>
+void BasePackedGraph<Backend>::serialize_with_paths(
+    ostream& out, size_t path_count, const PathName& path_name,
+    const PathSize& path_size, const PathSteps& path_steps, size_t workers,
+    size_t extra_memory_budget) const {
+    static_assert(std::is_same<Backend, STLBackend>::value,
+                  "Generated path output requires the ordinary in-memory backend");
+    if (!can_serialize_with_generated_paths()) {
+        throw std::invalid_argument("Generated paths require no live paths and fresh empty memberships");
+    }
+    if (workers <= 1 || extra_memory_budget == 0 || path_count < 2) {
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+    if (path_count == std::numeric_limits<size_t>::max() ||
+        path_count > std::numeric_limits<size_t>::max() - paths.size()) {
+        throw std::overflow_error("Generated path count overflow");
+    }
+
+    workers = std::min<size_t>(workers, 256);
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    auto saturated_add = [&](size_t left, size_t right) {
+        return right > maximum - left ? maximum : left + right;
+    };
+    auto saturated_multiply = [&](size_t left, size_t right) {
+        return left != 0 && right > maximum / left ? maximum : left * right;
+    };
+    auto ceiling_divide = [](size_t value, size_t divisor) {
+        return value == 0 ? size_t(0) : (value - 1) / divisor + 1;
+    };
+
+    const size_t prefix_bytes = saturated_multiply(path_count + 1, sizeof(size_t));
+    if (prefix_bytes == maximum || prefix_bytes > extra_memory_budget) {
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+
+    // Count every path before starting workers or writing output. The resulting
+    // prefix supplies stable global membership offsets to all later replays.
+    vector<size_t> prefix(path_count + 1, 0);
+    size_t total_steps = 0;
+    for (size_t i = 0; i < path_count; ++i) {
+        const size_t count = path_size(i);
+        if (count > maximum / PATH_RECORD_SIZE) {
+            throw std::overflow_error("Generated local path link count overflow");
+        }
+        if (count > maximum - total_steps) {
+            throw std::overflow_error("Generated path membership count overflow");
+        }
+        total_steps += count;
+        prefix[i + 1] = total_steps;
+    }
+
+    // Small path sets do less work and allocate less memory through the serial
+    // route. Each admitted block must cover at least one wide membership page.
+    size_t candidate_blocks = std::min(path_count, total_steps / WIDE_PAGE_WIDTH);
+    candidate_blocks = std::min(candidate_blocks, workers);
+    if (candidate_blocks < 2) {
+        vector<size_t>().swap(prefix);
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+    const size_t bounds_bytes = saturated_multiply(candidate_blocks + 1, sizeof(size_t));
+    if (bounds_bytes == maximum ||
+        saturated_add(prefix_bytes, bounds_bytes) > extra_memory_budget) {
+        vector<size_t>().swap(prefix);
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+
+    // Divide only at path boundaries, and merge short blocks that would make
+    // page history more expensive than serial replay.
+    vector<size_t> path_bounds;
+    path_bounds.reserve(candidate_blocks + 1);
+    path_bounds.push_back(0);
+    const size_t quotient = total_steps / candidate_blocks;
+    const size_t remainder = total_steps % candidate_blocks;
+    for (size_t block = 1; block < candidate_blocks; ++block) {
+        const size_t target = quotient * block + std::min(block, remainder);
+        const size_t previous_path = path_bounds.back();
+        auto found = std::lower_bound(prefix.begin() + previous_path + 1,
+                                      prefix.end(), target);
+        const size_t boundary = static_cast<size_t>(found - prefix.begin());
+        if (boundary < path_count && boundary > previous_path &&
+            prefix[boundary] > prefix[previous_path]) {
+            path_bounds.push_back(boundary);
+        }
+    }
+    path_bounds.push_back(path_count);
+    while (path_bounds.size() > 2) {
+        bool merged = false;
+        const size_t blocks = path_bounds.size() - 1;
+        for (size_t block = 0; block < blocks; ++block) {
+            const size_t begin = prefix[path_bounds[block]];
+            const size_t end = prefix[path_bounds[block + 1]];
+            if (end - begin < WIDE_PAGE_WIDTH) {
+                const size_t erase_at = block + 1 < blocks ? block + 1 : block;
+                path_bounds.erase(path_bounds.begin() + erase_at);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            break;
+        }
+    }
+
+    const size_t blocks = path_bounds.size() - 1;
+    if (blocks < 2) {
+        vector<size_t>().swap(path_bounds);
+        vector<size_t>().swap(prefix);
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+    const size_t active_workers = std::min(workers, blocks);
+    const size_t node_count = path_membership_node_iv.size();
+    const size_t node_pages = ceiling_divide(node_count, NARROW_PAGE_WIDTH);
+    const size_t head_entries = saturated_multiply(blocks, node_count);
+    const size_t extrema_entries = saturated_multiply(blocks, node_pages);
+    const size_t worker_stack_bytes = saturated_multiply(active_workers, size_t(8) << 20);
+    size_t planned_bytes = saturated_add(prefix_bytes, bounds_bytes);
+    planned_bytes = saturated_add(planned_bytes,
+                                  saturated_multiply(std::max<size_t>(head_entries, 1), sizeof(uint64_t)));
+    planned_bytes = saturated_add(planned_bytes,
+                                  saturated_multiply(std::max<size_t>(extrema_entries, 1),
+                                                     2 * sizeof(uint64_t)));
+    planned_bytes = saturated_add(planned_bytes,
+                                  saturated_multiply(node_count, sizeof(uint64_t)));
+    planned_bytes = saturated_add(planned_bytes, worker_stack_bytes);
+    if (planned_bytes == maximum || planned_bytes > extra_memory_budget) {
+        vector<size_t>().swap(path_bounds);
+        vector<size_t>().swap(prefix);
+        serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+        return;
+    }
+
+    // Path metadata mutation stays ordered because its packed-vector mutation
+    // history is part of the ordinary PackedGraph byte representation.
+    BasePackedGraph metadata(*this);
+    const size_t first_path = paths.size();
+    for (size_t i = 0; i < path_count; ++i) {
+        const string name = path_name(i);
+        const path_handle_t path = metadata.create_path_handle(name, false);
+        const size_t slot = first_path + i;
+        if (as_integer(path) != slot) {
+            throw std::logic_error("Generated path IDs are not contiguous");
+        }
+        const size_t count = prefix[i + 1] - prefix[i];
+        if (count != 0) {
+            metadata.path_tail_iv.set(slot, 1);
+            metadata.path_tail_iv.set(slot, count);
+            metadata.path_head_iv.set(slot, 1);
+        }
+    }
+
+    {
+        // Each block owns its row. Rows record final per-node heads and the
+        // extrema needed to reproduce serial packed-page width history.
+        vector<uint64_t> block_heads(std::max<size_t>(head_entries, 1), 0);
+        vector<uint64_t> page_min(std::max<size_t>(extrema_entries, 1), 0);
+        vector<uint64_t> page_max(std::max<size_t>(extrema_entries, 1), 0);
+        vector<uint64_t> final_heads(node_count, 0);
+
+        internal::bounded_parallel_for(blocks, active_workers, [&](size_t block) {
+            uint64_t* heads = block_heads.data() + block * node_count;
+            uint64_t* minima = page_min.data() + block * node_pages;
+            uint64_t* maxima = page_max.data() + block * node_pages;
+            std::fill(heads, heads + node_count, uint64_t(0));
+            std::fill(minima, minima + node_pages, uint64_t(0));
+            std::fill(maxima, maxima + node_pages, uint64_t(0));
+            size_t membership = prefix[path_bounds[block]];
+            for (size_t i = path_bounds[block]; i < path_bounds[block + 1]; ++i) {
+                const size_t count = prefix[i + 1] - prefix[i];
+                size_t visited = 0;
+                path_steps(i, [&](const handle_t& handle) {
+                    if (visited == count) {
+                        throw std::invalid_argument("Generated path has too many steps");
+                    }
+                    if (!has_node(get_id(handle))) {
+                        throw std::invalid_argument("Generated path visits a missing node");
+                    }
+                    const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+                    if (node >= node_count) {
+                        throw std::logic_error("Generated path node index is out of range");
+                    }
+                    const uint64_t occurrence = ++membership;
+                    heads[node] = occurrence;
+                    const size_t page = node / NARROW_PAGE_WIDTH;
+                    if (minima[page] == 0) {
+                        minima[page] = occurrence;
+                    }
+                    maxima[page] = std::max(maxima[page], occurrence);
+                    ++visited;
+                });
+                if (visited != count) {
+                    throw std::invalid_argument("Generated path has too few steps");
+                }
+            }
+            if (membership != prefix[path_bounds[block + 1]]) {
+                throw std::logic_error("Generated path membership block is inconsistent");
+            }
+        });
+
+        const size_t nodes_per_task = 4096;
+        const size_t node_tasks = ceiling_divide(node_count, nodes_per_task);
+        internal::bounded_parallel_for(node_tasks, active_workers, [&](size_t task) {
+            const size_t begin = task * nodes_per_task;
+            const size_t end = std::min(node_count, begin + nodes_per_task);
+            for (size_t node = begin; node < end; ++node) {
+                uint64_t head = 0;
+                for (size_t block = 0; block < blocks; ++block) {
+                    uint64_t& cell = block_heads[block * node_count + node];
+                    const uint64_t last = cell;
+                    cell = head;
+                    if (last != 0) {
+                        head = last;
+                    }
+                }
+                final_heads[node] = head;
+            }
+        });
+
+        for (size_t page = 0; page < node_pages; ++page) {
+            uint64_t minimum = 0;
+            uint64_t maximum_value = 0;
+            for (size_t block = 0; block < blocks; ++block) {
+                const size_t index = block * node_pages + page;
+                if (page_min[index] != 0 &&
+                    (minimum == 0 || page_min[index] < minimum)) {
+                    minimum = page_min[index];
+                }
+                maximum_value = std::max(maximum_value, page_max[index]);
+            }
+            if (minimum == 0) {
+                continue;
+            }
+            const size_t page_begin = page * NARROW_PAGE_WIDTH;
+            metadata.path_membership_node_iv.set(page_begin, minimum);
+            metadata.path_membership_node_iv.set(page_begin, maximum_value);
+            const size_t page_end = std::min(node_count, page_begin + NARROW_PAGE_WIDTH);
+            for (size_t node = page_begin; node < page_end; ++node) {
+                metadata.path_membership_node_iv.set(node, final_heads[node]);
+            }
+        }
+    }
+
+    auto generate_ids = [&](const auto& emit) {
+        for (size_t i = 0; i < path_count; ++i) {
+            const uint64_t slot = first_path + i;
+            for (size_t position = prefix[i]; position < prefix[i + 1]; ++position) {
+                emit(slot);
+            }
+        }
+    };
+    auto generate_offsets = [&](const auto& emit) {
+        for (size_t i = 0; i < path_count; ++i) {
+            for (size_t position = prefix[i]; position < prefix[i + 1]; ++position) {
+                emit(position - prefix[i] + 1);
+            }
+        }
+    };
+    auto generate_next = [&](const auto& emit) {
+        vector<uint64_t> heads(node_count, 0);
+        size_t membership = 0;
+        for (size_t i = 0; i < path_count; ++i) {
+            const size_t count = prefix[i + 1] - prefix[i];
+            size_t visited = 0;
+            path_steps(i, [&](const handle_t& handle) {
+                if (visited == count) {
+                    throw std::invalid_argument("Generated path replay has too many steps");
+                }
+                if (!has_node(get_id(handle))) {
+                    throw std::invalid_argument("Generated path replay visits a missing node");
+                }
+                const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+                emit(heads[node]);
+                heads[node] = ++membership;
+                ++visited;
+            });
+            if (visited != count) {
+                throw std::invalid_argument("Generated path replay has too few steps");
+            }
+        }
+    };
+
+    const uint32_t magic = htonl(get_magic_number());
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    sdsl::write_member(max_id, out);
+    sdsl::write_member(min_id, out);
+    graph_iv.serialize(out);
+    seq_start_iv.serialize(out);
+    seq_length_iv.serialize(out);
+    edge_lists_iv.serialize(out);
+    nid_to_graph_iv.serialize(out);
+    seq_iv.serialize(out);
+    metadata.path_membership_node_iv.serialize(out);
+    PagedVector<WIDE_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_ids);
+    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_offsets);
+    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_next);
+    sdsl::write_member(metadata.inverse_char_assignment, out);
+    metadata.path_names_iv.serialize(out);
+    metadata.path_name_start_iv.serialize(out);
+    metadata.path_name_length_iv.serialize(out);
+    metadata.path_is_deleted_iv.serialize(out);
+    metadata.path_is_circular_iv.serialize(out);
+    metadata.path_head_iv.serialize(out);
+    metadata.path_tail_iv.serialize(out);
+    metadata.path_deleted_steps_iv.serialize(out);
+
+    for (const PackedPath& previous : paths) {
+        previous.links_iv.serialize(out);
+        previous.steps_iv.serialize(out);
+    }
+    for (size_t i = 0; i < path_count; ++i) {
+        PackedPath local;
+        const size_t count = prefix[i + 1] - prefix[i];
+        size_t visited = 0;
+        path_steps(i, [&](const handle_t& handle) {
+            if (visited == count) {
+                throw std::invalid_argument("Generated local path has too many steps");
+            }
+            local.steps_iv.push_back(as_integer(handle));
+            local.links_iv.push_back(visited);
+            local.links_iv.push_back(0);
+            if (visited != 0) {
+                metadata.set_step_next(local, visited, visited + 1);
+            }
+            ++visited;
+        });
+        if (visited != count) {
+            throw std::invalid_argument("Generated local path has too few steps");
+        }
+        local.links_iv.serialize(out);
+        local.steps_iv.serialize(out);
+    }
+    sdsl::write_member(deleted_node_records, out);
+    sdsl::write_member(deleted_edge_records, out);
+    sdsl::write_member(deleted_membership_records, out);
+    sdsl::write_member(deleted_bases, out);
+    sdsl::write_member(reversing_self_edge_records, out);
+    sdsl::write_member(deleted_reversing_self_edge_records, out);
+    if (!out) {
+        throw std::runtime_error("Could not write generated PackedGraph paths");
+    }
 }
 
 template<typename Backend>

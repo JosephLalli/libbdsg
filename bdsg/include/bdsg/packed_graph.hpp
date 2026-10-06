@@ -38,6 +38,16 @@ public:
         get()->serialize_with_paths(out, path_count, path_name, path_size, path_steps);
     }
 
+    /// Generate paths after bounded parallel preflight, with serial fallback.
+    template<class PathName, class PathSize, class PathSteps>
+    void serialize_with_paths(std::ostream& out, size_t path_count,
+                              const PathName& path_name, const PathSize& path_size,
+                              const PathSteps& path_steps, size_t workers,
+                              size_t extra_memory_budget) const {
+        get()->serialize_with_paths(out, path_count, path_name, path_size,
+                                    path_steps, workers, extra_memory_budget);
+    }
+
 protected:
     /**
      * Get the object that actually provides the graph methods.

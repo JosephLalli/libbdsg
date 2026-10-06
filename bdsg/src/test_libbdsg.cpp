@@ -822,6 +822,89 @@ void test_generated_path_serialization() {
   cerr << "Generated path serialization tests successful!" << endl;
 }
 
+void test_parallel_generated_path_serialization() {
+
+  const size_t path_count = 4;
+  const size_t steps_per_path = 1024;
+  const size_t node_count = 513;
+  const size_t budget = size_t(32) << 20;
+  auto path_name = [](size_t i) { return string("parallel-") + to_string(i); };
+
+  auto initialize = [&](PackedGraph& graph) {
+    for (size_t i = 0; i < node_count; ++i) {
+      graph.create_handle("A");
+    }
+  };
+  auto emit_paths = [&](const PackedGraph& graph, size_t i, const auto& emit) {
+    for (size_t j = 0; j < steps_per_path; ++j) {
+      emit(graph.get_handle((17 * j + 97 * i) % node_count + 1, (i + j) % 2));
+    }
+  };
+
+  PackedGraph ordinary;
+  initialize(ordinary);
+  for (size_t i = 0; i < path_count; ++i) {
+    const path_handle_t path = ordinary.create_path_handle(path_name(i));
+    for (size_t j = 0; j < steps_per_path; ++j) {
+      ordinary.append_step(path,
+                           ordinary.get_handle((17 * j + 97 * i) % node_count + 1,
+                                               (i + j) % 2));
+    }
+  }
+  stringstream expected;
+  ordinary.serialize(expected);
+
+  PackedGraph parallel;
+  initialize(parallel);
+  stringstream observed;
+  parallel.serialize_with_paths(
+      observed, path_count, path_name,
+      [&](size_t) { return steps_per_path; },
+      [&](size_t i, const auto& emit) { emit_paths(parallel, i, emit); }, 2, budget);
+  assert(observed.str() == expected.str());
+
+  PackedGraph fallback;
+  initialize(fallback);
+  stringstream fallback_output;
+  fallback.serialize_with_paths(
+      fallback_output, path_count, path_name,
+      [&](size_t) { return steps_per_path; },
+      [&](size_t i, const auto& emit) { emit_paths(fallback, i, emit); }, 2, 1);
+  assert(fallback_output.str() == expected.str());
+
+  PackedGraph invalid;
+  initialize(invalid);
+  stringstream unchanged("seed");
+  bool rejected = false;
+  try {
+    invalid.serialize_with_paths(
+        unchanged, path_count, path_name,
+        [&](size_t) { return steps_per_path; },
+        [&](size_t, const auto& emit) { emit(invalid.get_handle(1)); }, 2, budget);
+  } catch (const exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(unchanged.str() == "seed");
+
+  PackedGraph producer_error;
+  initialize(producer_error);
+  stringstream error_unchanged("seed");
+  bool error_rethrown = false;
+  try {
+    producer_error.serialize_with_paths(
+        error_unchanged, path_count, path_name,
+        [&](size_t) { return steps_per_path; },
+        [](size_t, const auto&) { throw runtime_error("producer failure"); }, 2, budget);
+  } catch (const runtime_error&) {
+    error_rethrown = true;
+  }
+  assert(error_rethrown);
+  assert(error_unchanged.str() == "seed");
+
+  cerr << "Parallel generated path serialization tests successful!" << endl;
+}
+
 void test_deletable_handle_graphs() {
 
   // first batch of tests
@@ -5532,6 +5615,7 @@ int main(void) {
   test_deletable_handle_graphs();
   test_serializable_handle_graphs();
   test_generated_path_serialization();
+  test_parallel_generated_path_serialization();
   test_packed_graph();
   test_path_position_overlays();
   test_packed_reference_path_overlay();
