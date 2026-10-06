@@ -739,6 +739,55 @@ void test_serializable_handle_graphs() {
   cerr << "SerializableHandleGraph tests successful!" << endl;
 }
 
+template<size_t page_size>
+void test_parallel_generated_pages() {
+  size_t count = page_size * 7 + 3;
+  vector<size_t> offsets{0, page_size + 1, page_size * 4 + 2, count};
+  auto value = [](size_t i) {
+    return i % 5 == 0 ? uint64_t(0) : i % 7 == 0 ? uint64_t(1) << 40 : i * 3;
+  };
+  PagedVector<page_size> ordinary;
+  for (size_t i = 0; i < count; ++i) {
+    ordinary.push_back(value(i));
+  }
+  stringstream expected;
+  ordinary.serialize(expected);
+  auto generate = [&](size_t block, const auto& emit) {
+    for (size_t i = offsets[block]; i < offsets[block + 1]; ++i) {
+      emit(value(i));
+    }
+  };
+  for (size_t workers : {size_t(1), size_t(2), size_t(4)}) {
+    stringstream output;
+    PagedVector<page_size>::serialize_generated_parallel(
+        output, count, offsets, workers, 9, generate);
+    assert(output.str() == expected.str());
+    PagedVector<page_size> reloaded;
+    reloaded.deserialize(output);
+    for (size_t i = 0; i < count; ++i) {
+      assert(reloaded.get(i) == value(i));
+    }
+  }
+  bool invalid = false;
+  stringstream unchanged;
+  try {
+    PagedVector<page_size>::serialize_generated_parallel(
+        unchanged, count, vector<size_t>{0, count, count}, 2, 9, generate);
+  } catch (const invalid_argument&) {
+    invalid = true;
+  }
+  assert(invalid && unchanged.str().empty());
+  bool failed = false;
+  try {
+    PagedVector<page_size>::serialize_generated_parallel(
+        unchanged, count, offsets, 2, 9,
+        [](size_t, const auto&) { throw runtime_error("producer failure"); });
+  } catch (const runtime_error&) {
+    failed = true;
+  }
+  assert(failed && unchanged.str().empty());
+}
+
 void test_generated_path_serialization() {
 
   const vector<string> names{"alpha", "beta"};
@@ -5615,6 +5664,9 @@ int main(void) {
   test_deletable_handle_graphs();
   test_serializable_handle_graphs();
   test_generated_path_serialization();
+  test_parallel_generated_pages<4>();
+  test_parallel_generated_pages<64>();
+  test_parallel_generated_pages<256>();
   test_parallel_generated_path_serialization();
   test_packed_graph();
   test_path_position_overlays();

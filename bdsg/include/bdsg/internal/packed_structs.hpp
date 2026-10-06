@@ -17,6 +17,7 @@
 #include <random>
 #include <sdsl/int_vector.hpp>
 
+#include <bdsg/internal/bounded_parallel.hpp>
 #include <bdsg/internal/indexing_iterator.hpp>
 #include <bdsg/internal/mapped_structs.hpp>
 
@@ -216,6 +217,13 @@ public:
     template<class Generator>
     static void serialize_generated(ostream& out, size_t count,
                                     Generator&& generate);
+
+    /// Pack independently replayable blocks concurrently in ordinary page order.
+    /// block_offsets starts at zero, ends at count, and has no empty blocks.
+    template<class BlockGenerator>
+    static void serialize_generated_parallel(
+        ostream& out, size_t count, const vector<size_t>& block_offsets,
+        size_t workers, size_t chunk_bytes, BlockGenerator&& generate);
     
     /// Set the i-th value
     inline void set(const size_t& i, const uint64_t& value);
@@ -1132,6 +1140,218 @@ void PagedVector<page_size, Backend>::serialize_generated(
     }
     if (serialized_pages != generated_anchors.size()) {
         throw std::logic_error("Generated PagedVector page count is inconsistent");
+    }
+}
+
+template<size_t page_size, typename Backend>
+template<class BlockGenerator>
+void PagedVector<page_size, Backend>::serialize_generated_parallel(
+    ostream& out, size_t count, const vector<size_t>& block_offsets,
+    size_t workers, size_t chunk_bytes, BlockGenerator&& generate) {
+    static_assert(page_size > 0, "Generated PagedVector pages must be nonempty");
+    static_assert(std::is_same<Backend, STLBackend>::value,
+                  "Generated PagedVector serialization requires STLBackend");
+
+    if (block_offsets.size() < 2 || block_offsets.front() != 0 ||
+        block_offsets.back() != count) {
+        throw std::invalid_argument("Generated PagedVector block offsets are inconsistent");
+    }
+    for (size_t i = 1; i < block_offsets.size(); ++i) {
+        if (block_offsets[i] <= block_offsets[i - 1]) {
+            throw std::invalid_argument("Generated PagedVector blocks must be nonempty and ordered");
+        }
+    }
+
+    const size_t blocks = block_offsets.size() - 1;
+    auto serial_generate = [&](const auto& emit) {
+        for (size_t block = 0; block < blocks; ++block) {
+            generate(block, emit);
+        }
+    };
+    // Tiny blocks can share a page with several neighbors. They offer no useful
+    // packing parallelism, so retain the exact serial path for that shape.
+    bool use_parallel = workers > 1 && blocks > 1;
+    for (size_t block = 0; block < blocks && use_parallel; ++block) {
+        use_parallel = block_offsets[block + 1] - block_offsets[block] >= page_size;
+    }
+    if (!use_parallel) {
+        serialize_generated(out, count, serial_generate);
+        return;
+    }
+
+    const size_t pages_count = count == 0 ? 0 : (count - 1) / page_size + 1;
+    struct BoundaryPage {
+        size_t page = 0;
+        vector<uint64_t> values;
+    };
+    vector<size_t> boundary_page_numbers;
+    boundary_page_numbers.reserve(blocks);
+    for (size_t block = 1; block < blocks; ++block) {
+        if (block_offsets[block] % page_size != 0) {
+            boundary_page_numbers.push_back(block_offsets[block] / page_size);
+        }
+    }
+    if (count % page_size != 0) {
+        boundary_page_numbers.push_back(count / page_size);
+    }
+    sort(boundary_page_numbers.begin(), boundary_page_numbers.end());
+    boundary_page_numbers.erase(unique(boundary_page_numbers.begin(),
+                                       boundary_page_numbers.end()),
+                                boundary_page_numbers.end());
+    vector<BoundaryPage> boundary_pages;
+    boundary_pages.reserve(boundary_page_numbers.size());
+    for (size_t page : boundary_page_numbers) {
+        const size_t begin = page * page_size;
+        boundary_pages.push_back(BoundaryPage{
+            page, vector<uint64_t>(std::min(page_size, count - begin), 0)});
+    }
+    auto boundary = [&](size_t page) -> BoundaryPage* {
+        auto found = lower_bound(boundary_pages.begin(), boundary_pages.end(), page,
+            [](const BoundaryPage& item, size_t value) { return item.page < value; });
+        return found != boundary_pages.end() && found->page == page ? &*found : nullptr;
+    };
+
+    // Every non-boundary page belongs to exactly one block. Adjacent blocks
+    // write disjoint elements of the retained boundary pages.
+    vector<uint64_t> anchor_values(pages_count, 0);
+    internal::bounded_parallel_for(blocks, workers, [&](size_t block) {
+        const size_t begin = block_offsets[block];
+        const size_t expected = block_offsets[block + 1] - begin;
+        BoundaryPage* first_boundary = boundary(begin / page_size);
+        BoundaryPage* last_boundary = boundary((block_offsets[block + 1] - 1) / page_size);
+        size_t emitted = 0;
+        generate(block, [&](uint64_t value) {
+            if (emitted == expected) {
+                throw std::length_error("Generated PagedVector block emitted too many values");
+            }
+            const size_t position = begin + emitted++;
+            const size_t page = position / page_size;
+            BoundaryPage* storage = nullptr;
+            if (first_boundary != nullptr && first_boundary->page == page) {
+                storage = first_boundary;
+            } else if (last_boundary != nullptr && last_boundary->page == page) {
+                storage = last_boundary;
+            }
+            if (storage != nullptr) {
+                storage->values[position - page * page_size] = value;
+            } else if (anchor_values[page] == 0 && value != 0) {
+                anchor_values[page] = value;
+            }
+        });
+        if (emitted != expected) {
+            throw std::length_error("Generated PagedVector block emitted too few values");
+        }
+    });
+    for (const BoundaryPage& item : boundary_pages) {
+        for (uint64_t value : item.values) {
+            if (value != 0) {
+                anchor_values[item.page] = value;
+                break;
+            }
+        }
+    }
+
+    PackedVector<STLBackend> generated_anchors;
+    for (uint64_t anchor : anchor_values) {
+        generated_anchors.push_back(0);
+        if (anchor != 0) {
+            generated_anchors.set(generated_anchors.size() - 1, anchor);
+        }
+    }
+    sdsl::write_member(count, out);
+    sdsl::write_member(page_size, out);
+    generated_anchors.serialize(out);
+    if (!out) {
+        throw std::runtime_error("Error writing generated PagedVector header");
+    }
+
+    auto write_boundary_page = [&](size_t page, ostream& destination) {
+        BoundaryPage* item = boundary(page);
+        if (item == nullptr) {
+            throw std::logic_error("Missing generated PagedVector boundary page");
+        }
+        PagedVector<page_size, STLBackend> scratch;
+        for (uint64_t value : item->values) {
+            scratch.push_back(value);
+        }
+        if (scratch.pages.size() != 1 ||
+            scratch.anchors.get(0) != generated_anchors.get(page)) {
+            throw std::logic_error("Generated PagedVector boundary anchor mismatch");
+        }
+        scratch.pages[0].serialize(destination);
+    };
+
+    size_t next_page = 0;
+    internal::bounded_ordered_output(out, blocks, workers, chunk_bytes,
+        [&](size_t block, ostream& block_out) {
+            const size_t begin = block_offsets[block];
+            const size_t expected = block_offsets[block + 1] - begin;
+            BoundaryPage* first_boundary = boundary(begin / page_size);
+            BoundaryPage* last_boundary = boundary((block_offsets[block + 1] - 1) / page_size);
+            PagedVector<page_size, STLBackend> scratch;
+            size_t scratch_page = std::numeric_limits<size_t>::max();
+            size_t emitted = 0;
+            generate(block, [&](uint64_t value) {
+                if (emitted == expected) {
+                    throw std::length_error("Generated PagedVector replay emitted too many values");
+                }
+                const size_t position = begin + emitted++;
+                const size_t page = position / page_size;
+                BoundaryPage* storage = nullptr;
+                if (first_boundary != nullptr && first_boundary->page == page) {
+                    storage = first_boundary;
+                } else if (last_boundary != nullptr && last_boundary->page == page) {
+                    storage = last_boundary;
+                }
+                if (storage != nullptr) {
+                    if (storage->values[position - page * page_size] != value) {
+                        throw std::invalid_argument("Generated PagedVector changed between passes");
+                    }
+                    return;
+                }
+                if (scratch.empty()) {
+                    scratch_page = page;
+                } else if (scratch_page != page) {
+                    throw std::logic_error("Generated PagedVector page crossed an unmarked block boundary");
+                }
+                scratch.push_back(value);
+                if (scratch.size() == page_size) {
+                    if (scratch.anchors.get(0) != generated_anchors.get(page)) {
+                        throw std::invalid_argument("Generated PagedVector changed between passes");
+                    }
+                    scratch.pages[0].serialize(block_out);
+                    scratch.clear();
+                }
+            });
+            if (emitted != expected) {
+                throw std::length_error("Generated PagedVector replay emitted too few values");
+            }
+            if (!scratch.empty()) {
+                throw std::logic_error("Generated PagedVector retained an incomplete interior page");
+            }
+        },
+        [&](size_t block, ostream& destination) {
+            const size_t first_interior =
+                (block_offsets[block] + page_size - 1) / page_size;
+            while (next_page < first_interior) {
+                write_boundary_page(next_page++, destination);
+            }
+            if (next_page != first_interior) {
+                throw std::logic_error("Generated PagedVector pages are out of order");
+            }
+        },
+        [&](size_t block, ostream&) {
+            const size_t interior_end = block_offsets[block + 1] / page_size;
+            if (interior_end < next_page) {
+                throw std::logic_error("Generated PagedVector block is smaller than one page");
+            }
+            next_page = interior_end;
+        });
+    while (next_page < pages_count) {
+        write_boundary_page(next_page++, out);
+    }
+    if (!out) {
+        throw std::runtime_error("Error writing generated PagedVector pages");
     }
 }
 

@@ -1346,6 +1346,43 @@ void BasePackedGraph<Backend>::serialize_with_paths(
         return;
     }
 
+    // Bound section anchors, aligned block indexes, and the ordered output
+    // ring before starting a producer or writing the graph header.
+    constexpr size_t generated_block_values = 8192;
+    const size_t chunk_bytes = size_t(1) << 20;
+    const size_t section_pages = saturated_add(ceiling_divide(total_steps, WIDE_PAGE_WIDTH),
+                                               ceiling_divide(total_steps, NARROW_PAGE_WIDTH));
+    size_t packing_bytes = saturated_multiply(section_pages, size_t(24));
+    packing_bytes = saturated_add(packing_bytes, saturated_multiply(
+        ceiling_divide(total_steps, generated_block_values) + 1, 2 * sizeof(size_t)));
+    packing_bytes = saturated_add(packing_bytes, saturated_multiply(
+        3 * active_workers + 2, chunk_bytes + 512));
+    packing_bytes = saturated_add(packing_bytes, saturated_multiply(
+        active_workers + 2, 24 * WIDE_PAGE_WIDTH));
+    const size_t packing_plan = saturated_add(planned_bytes, packing_bytes);
+    const bool parallel_sections = packing_plan != maximum &&
+        packing_plan <= extra_memory_budget;
+    auto section_offsets = [&](size_t page_width) {
+        vector<size_t> offsets{0};
+        for (size_t position = generated_block_values; position < total_steps;) {
+            offsets.push_back(position);
+            if (total_steps - position <= generated_block_values) {
+                break;
+            }
+            position += generated_block_values;
+        }
+        offsets.push_back(total_steps);
+        if (offsets.size() > 2 && offsets.back() - offsets[offsets.size() - 2] < page_width) {
+            offsets.erase(offsets.end() - 2);
+        }
+        return offsets;
+    };
+    vector<size_t> id_offsets, rank_offsets;
+    if (parallel_sections) {
+        id_offsets = section_offsets(WIDE_PAGE_WIDTH);
+        rank_offsets = section_offsets(NARROW_PAGE_WIDTH);
+    }
+
     // Path metadata mutation stays ordered because its packed-vector mutation
     // history is part of the ordinary PackedGraph byte representation.
     BasePackedGraph metadata(*this);
@@ -1456,20 +1493,47 @@ void BasePackedGraph<Backend>::serialize_with_paths(
         }
     }
 
-    auto generate_ids = [&](const auto& emit) {
-        for (size_t i = 0; i < path_count; ++i) {
-            const uint64_t slot = first_path + i;
-            for (size_t position = prefix[i]; position < prefix[i + 1]; ++position) {
-                emit(slot);
+    auto generate_linear = [&](const vector<size_t>& offsets, size_t block,
+                               bool ids, const auto& emit) {
+        size_t position = offsets[block];
+        const size_t end = offsets[block + 1];
+        auto found = std::upper_bound(prefix.begin(), prefix.end(), position);
+        if (found == prefix.begin() || found == prefix.end()) {
+            throw std::logic_error("Generated membership position is out of range");
+        }
+        size_t path = static_cast<size_t>(found - prefix.begin() - 1);
+        while (position < end) {
+            const size_t path_end = std::min(end, prefix[path + 1]);
+            if (path_end <= position) {
+                throw std::logic_error("Generated membership prefix is inconsistent");
+            }
+            if (ids) {
+                const uint64_t slot = first_path + path;
+                while (position < path_end) {
+                    emit(slot);
+                    ++position;
+                }
+            } else {
+                while (position < path_end) {
+                    emit(position - prefix[path] + 1);
+                    ++position;
+                }
+            }
+            if (position < end) {
+                found = std::upper_bound(prefix.begin() + path + 1,
+                                         prefix.end(), position);
+                if (found == prefix.end()) {
+                    throw std::logic_error("Generated membership prefix ended early");
+                }
+                path = static_cast<size_t>(found - prefix.begin() - 1);
             }
         }
     };
-    auto generate_offsets = [&](const auto& emit) {
-        for (size_t i = 0; i < path_count; ++i) {
-            for (size_t position = prefix[i]; position < prefix[i + 1]; ++position) {
-                emit(position - prefix[i] + 1);
-            }
-        }
+    auto generate_ids = [&](size_t block, const auto& emit) {
+        generate_linear(id_offsets, block, true, emit);
+    };
+    auto generate_offsets = [&](size_t block, const auto& emit) {
+        generate_linear(rank_offsets, block, false, emit);
     };
     auto generate_next = [&](const auto& emit) {
         vector<uint64_t> heads(node_count, 0);
@@ -1506,8 +1570,20 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     nid_to_graph_iv.serialize(out);
     seq_iv.serialize(out);
     metadata.path_membership_node_iv.serialize(out);
-    PagedVector<WIDE_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_ids);
-    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_offsets);
+    if (parallel_sections) {
+        PagedVector<WIDE_PAGE_WIDTH>::serialize_generated_parallel(
+            out, total_steps, id_offsets, active_workers, chunk_bytes, generate_ids);
+        PagedVector<NARROW_PAGE_WIDTH>::serialize_generated_parallel(
+            out, total_steps, rank_offsets, active_workers, chunk_bytes, generate_offsets);
+    } else {
+        const vector<size_t> serial_offsets{0, total_steps};
+        auto serial_ids = [&](const auto& emit) { generate_linear(serial_offsets, 0, true, emit); };
+        auto serial_ranks = [&](const auto& emit) { generate_linear(serial_offsets, 0, false, emit); };
+        PagedVector<WIDE_PAGE_WIDTH>::serialize_generated(out, total_steps, serial_ids);
+        PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, serial_ranks);
+    }
+    vector<size_t>().swap(id_offsets);
+    vector<size_t>().swap(rank_offsets);
     PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_next);
     sdsl::write_member(metadata.inverse_char_assignment, out);
     metadata.path_names_iv.serialize(out);
