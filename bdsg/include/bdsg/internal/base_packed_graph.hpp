@@ -8,7 +8,12 @@
 #ifndef BDSG_BASE_PACKED_GRAPH_HPP_INCLUDED
 #define BDSG_BASE_PACKED_GRAPH_HPP_INCLUDED
 
+#include <functional>
+#include <limits>
+#include <string>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <handlegraph/util.hpp>
 
@@ -67,6 +72,21 @@ public:
     
     /// Construct from a stream
     BasePackedGraph(istream& in);
+
+    /// Whether generated append-only path output can preserve this graph's
+    /// ordinary PackedGraph wire representation.
+    bool can_serialize_with_generated_paths() const;
+
+    /**
+     * Write this graph plus replayable noncircular named walks directly to the
+     * ordinary PackedGraph wire format. The source graph is unchanged.
+     * path_name(i), path_size(i), and path_steps(i, emit(handle)) must describe
+     * the same walk on every replay.
+     */
+    template<class PathName, class PathSize, class PathSteps>
+    void serialize_with_paths(ostream& out, size_t path_count,
+                              const PathName& path_name, const PathSize& path_size,
+                              const PathSteps& path_steps) const;
     
 private:
     
@@ -995,6 +1015,184 @@ BasePackedGraph<Backend>::BasePackedGraph(istream& in) : BasePackedGraph() {
 template<typename Backend>
 BasePackedGraph<Backend>::~BasePackedGraph() {
     // Nothing to do!
+}
+
+template<typename Backend>
+bool BasePackedGraph<Backend>::can_serialize_with_generated_paths() const {
+    auto fresh_empty = [](const auto& values) {
+        using Vector = typename std::decay<decltype(values)>::type;
+        // Reject retained reserved storage too: the generated append stream
+        // must start with the same packed-vector width/capacity history.
+        return values.empty() && values.memory_usage() == Vector().memory_usage();
+    };
+    if (!path_id.empty() || deleted_membership_records != 0 ||
+        !fresh_empty(path_membership_id_iv) ||
+        !fresh_empty(path_membership_offset_iv) ||
+        !fresh_empty(path_membership_next_iv)) {
+        return false;
+    }
+    // Removing all original GBZ reference paths can leave deleted path slots
+    // and names behind. Keep those slots: ordinary append assigns new path IDs
+    // after them, and their metadata is part of the serialized graph.
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (!path_is_deleted_iv.get(i)) { return false; }
+    }
+    for (size_t i = 0; i < path_membership_node_iv.size(); ++i) {
+        if (path_membership_node_iv.get(i) != 0) { return false; }
+    }
+    return true;
+}
+
+template<typename Backend>
+template<class PathName, class PathSize, class PathSteps>
+void BasePackedGraph<Backend>::serialize_with_paths(
+    ostream& out, size_t path_count, const PathName& path_name,
+    const PathSize& path_size, const PathSteps& path_steps) const {
+    static_assert(std::is_same<Backend, STLBackend>::value,
+                  "Generated path output requires the ordinary in-memory backend");
+    if (!can_serialize_with_generated_paths()) {
+        throw std::invalid_argument("Generated paths require no live paths and fresh empty memberships");
+    }
+
+    // Only topology and inactive path storage are copied. No step-sized object
+    // exists in either graph; this metadata copy remains proportional to nodes,
+    // edges and path names throughout construction.
+    BasePackedGraph metadata(*this);
+    const size_t first_path = paths.size();
+    if (path_count > std::numeric_limits<size_t>::max() - first_path) {
+        throw std::overflow_error("Generated path count overflow");
+    }
+    size_t total_steps = 0;
+    for (size_t i = 0; i < path_count; ++i) {
+        const size_t count = path_size(i);
+        if (count > std::numeric_limits<size_t>::max() - total_steps) {
+            throw std::overflow_error("Generated path membership count overflow");
+        }
+        const string name = path_name(i);
+        if (metadata.has_path(name)) {
+            throw std::invalid_argument("Generated path name already exists");
+        }
+        const path_handle_t path = metadata.create_path_handle(name, false);
+        const size_t slot = first_path + i;
+        if (as_integer(path) != slot) {
+            throw std::logic_error("Generated path IDs are not contiguous");
+        }
+        if (count != 0) {
+            // append_step() first sets a tail to 1, choosing its page's anchor,
+            // then increases it monotonically. Setting only count would choose
+            // a different anchor and change the ordinary serialized bytes.
+            metadata.path_tail_iv.set(slot, 1);
+            metadata.path_tail_iv.set(slot, count);
+            metadata.path_head_iv.set(slot, 1);
+        }
+        size_t visited = 0;
+        path_steps(i, [&](const handle_t& handle) {
+            if (visited == count) {
+                throw std::invalid_argument("Generated path has too many steps");
+            }
+            if (!has_node(get_id(handle))) {
+                throw std::invalid_argument("Generated path visits a missing node");
+            }
+            ++visited;
+            const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+            metadata.path_membership_node_iv.set(node, total_steps + visited);
+        });
+        if (visited != count) {
+            throw std::invalid_argument("Generated path has too few steps");
+        }
+        total_steps += count;
+    }
+
+    // The original node-head vector is reused as the reset state for each
+    // replay of membership next-links. A dense scratch vector avoids touching
+    // packed pages merely to retrieve the preceding head.
+    auto generate_ids = [&](const auto& emit) {
+        for (size_t i = 0; i < path_count; ++i) {
+            const size_t slot = first_path + i;
+            for (size_t j = 0, count = metadata.path_tail_iv.get(slot); j < count; ++j) { emit(slot); }
+        }
+    };
+    auto generate_offsets = [&](const auto& emit) {
+        for (size_t i = 0; i < path_count; ++i) {
+            for (size_t j = 0, count = metadata.path_tail_iv.get(first_path + i); j < count; ++j) { emit(j + 1); }
+        }
+    };
+    auto generate_next = [&](const auto& emit) {
+        std::vector<uint64_t> heads(path_membership_node_iv.size(), 0);
+        size_t membership = 0;
+        for (size_t i = 0; i < path_count; ++i) {
+            const size_t count = metadata.path_tail_iv.get(first_path + i);
+            size_t visited = 0;
+            path_steps(i, [&](const handle_t& handle) {
+                if (visited == count) {
+                    throw std::invalid_argument("Generated path replay has too many steps");
+                }
+                const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+                emit(heads[node]);
+                heads[node] = ++membership;
+                ++visited;
+            });
+            if (visited != count) {
+                throw std::invalid_argument("Generated path replay has too few steps");
+            }
+        }
+    };
+
+    const uint32_t magic = htonl(get_magic_number());
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    sdsl::write_member(max_id, out);
+    sdsl::write_member(min_id, out);
+    graph_iv.serialize(out);
+    seq_start_iv.serialize(out);
+    seq_length_iv.serialize(out);
+    edge_lists_iv.serialize(out);
+    nid_to_graph_iv.serialize(out);
+    seq_iv.serialize(out);
+    metadata.path_membership_node_iv.serialize(out);
+    PagedVector<WIDE_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_ids);
+    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_offsets);
+    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_next);
+    sdsl::write_member(metadata.inverse_char_assignment, out);
+    metadata.path_names_iv.serialize(out);
+    metadata.path_name_start_iv.serialize(out);
+    metadata.path_name_length_iv.serialize(out);
+    metadata.path_is_deleted_iv.serialize(out);
+    metadata.path_is_circular_iv.serialize(out);
+    metadata.path_head_iv.serialize(out);
+    metadata.path_tail_iv.serialize(out);
+    metadata.path_deleted_steps_iv.serialize(out);
+
+    for (const PackedPath& previous : paths) {
+        previous.links_iv.serialize(out);
+        previous.steps_iv.serialize(out);
+    }
+    for (size_t i = 0; i < path_count; ++i) {
+        PackedPath local;
+        const size_t count = metadata.path_tail_iv.get(first_path + i);
+        size_t visited = 0;
+        path_steps(i, [&](const handle_t& handle) {
+            if (visited == count) {
+                throw std::invalid_argument("Generated local path has too many steps");
+            }
+            local.steps_iv.push_back(as_integer(handle));
+            local.links_iv.push_back(visited);
+            local.links_iv.push_back(0);
+            if (visited != 0) { metadata.set_step_next(local, visited, visited + 1); }
+            ++visited;
+        });
+        if (visited != count) {
+            throw std::invalid_argument("Generated local path has too few steps");
+        }
+        local.links_iv.serialize(out);
+        local.steps_iv.serialize(out);
+    }
+    sdsl::write_member(deleted_node_records, out);
+    sdsl::write_member(deleted_edge_records, out);
+    sdsl::write_member(deleted_membership_records, out);
+    sdsl::write_member(deleted_bases, out);
+    sdsl::write_member(reversing_self_edge_records, out);
+    sdsl::write_member(deleted_reversing_self_edge_records, out);
+    if (!out) { throw std::runtime_error("Could not write generated PackedGraph paths"); }
 }
 
 template<typename Backend>
