@@ -5,6 +5,7 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <deque>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <stdio.h>
 #include <thread>
 #include <unordered_set>
@@ -737,6 +739,82 @@ void test_serializable_handle_graphs() {
   }
 
   cerr << "SerializableHandleGraph tests successful!" << endl;
+}
+
+void test_bounded_ordered_output() {
+  const size_t blocks = 37;
+  const size_t workers = 3;
+  const size_t chunk_bytes = 7;
+  vector<string> payloads;
+  string expected;
+  for (size_t block = 0; block < blocks; ++block) {
+    payloads.push_back(string(block % 11 + 9, char('a' + block % 26)));
+    expected += "<" + to_string(block) + ">" + payloads.back() + ";";
+  }
+  stringstream observed;
+  internal::bounded_ordered_output(
+      observed, blocks, workers, chunk_bytes,
+      [&](size_t block, ostream& out) {
+        for (size_t i = block % 5; i != 0; --i) {
+          this_thread::yield();
+        }
+        out << payloads[block];
+      },
+      [&](size_t block, ostream& out) { out << "<" << block << ">"; },
+      [](size_t, ostream& out) { out << ";"; });
+  assert(observed.str() == expected);
+
+  struct ActiveGuard {
+    atomic<size_t>& active;
+    ActiveGuard(atomic<size_t>& active) : active(active) { ++active; }
+    ~ActiveGuard() { --active; }
+  };
+
+  atomic<size_t> active{0};
+  atomic<bool> release_first{false};
+  bool producer_failed = false;
+  try {
+    stringstream ignored;
+    internal::bounded_ordered_output(
+        ignored, 32, 4, 8,
+        [&](size_t block, ostream& out) {
+          ActiveGuard guard(active);
+          if (block == 0) {
+            while (!release_first.load(memory_order_acquire)) {
+              this_thread::yield();
+            }
+          } else if (block == 1) {
+            release_first.store(true, memory_order_release);
+            throw runtime_error("ordered producer failure");
+          }
+          out << string(1024, char('a' + block % 26));
+        });
+  } catch (const runtime_error& error) {
+    producer_failed = string(error.what()) == "ordered producer failure";
+  }
+  assert(producer_failed);
+  assert(active.load() == 0);
+
+  struct FailingBuffer : streambuf {
+    streamsize xsputn(const char*, streamsize) override { return 0; }
+    int_type overflow(int_type) override { return traits_type::eof(); }
+  } failing_buffer;
+  ostream failing_output(&failing_buffer);
+  bool writer_failed = false;
+  try {
+    internal::bounded_ordered_output(
+        failing_output, 32, 4, 8,
+        [&](size_t block, ostream& out) {
+          ActiveGuard guard(active);
+          out << string(1024, char('a' + block % 26));
+        });
+  } catch (const runtime_error& error) {
+    writer_failed = string(error.what()) == "Error writing ordered output block";
+  }
+  assert(writer_failed);
+  assert(active.load() == 0);
+
+  cerr << "Bounded ordered output tests successful!" << endl;
 }
 
 template<size_t page_size>
@@ -5663,6 +5741,7 @@ int main(void) {
   test_mutable_path_handle_graphs();
   test_deletable_handle_graphs();
   test_serializable_handle_graphs();
+  test_bounded_ordered_output();
   test_generated_path_serialization();
   test_parallel_generated_pages<4>();
   test_parallel_generated_pages<64>();
