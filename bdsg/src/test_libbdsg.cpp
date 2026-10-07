@@ -5,6 +5,7 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <deque>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <stdio.h>
 #include <thread>
 #include <unordered_set>
@@ -739,6 +741,131 @@ void test_serializable_handle_graphs() {
   cerr << "SerializableHandleGraph tests successful!" << endl;
 }
 
+void test_bounded_ordered_output() {
+  const size_t blocks = 37;
+  const size_t workers = 3;
+  const size_t chunk_bytes = 7;
+  vector<string> payloads;
+  string expected;
+  for (size_t block = 0; block < blocks; ++block) {
+    payloads.push_back(string(block % 11 + 9, char('a' + block % 26)));
+    expected += "<" + to_string(block) + ">" + payloads.back() + ";";
+  }
+  stringstream observed;
+  internal::bounded_ordered_output(
+      observed, blocks, workers, chunk_bytes,
+      [&](size_t block, ostream& out) {
+        for (size_t i = block % 5; i != 0; --i) {
+          this_thread::yield();
+        }
+        out << payloads[block];
+      },
+      [&](size_t block, ostream& out) { out << "<" << block << ">"; },
+      [](size_t, ostream& out) { out << ";"; });
+  assert(observed.str() == expected);
+
+  struct ActiveGuard {
+    atomic<size_t>& active;
+    ActiveGuard(atomic<size_t>& active) : active(active) { ++active; }
+    ~ActiveGuard() { --active; }
+  };
+
+  atomic<size_t> active{0};
+  atomic<bool> release_first{false};
+  bool producer_failed = false;
+  try {
+    stringstream ignored;
+    internal::bounded_ordered_output(
+        ignored, 32, 4, 8,
+        [&](size_t block, ostream& out) {
+          ActiveGuard guard(active);
+          if (block == 0) {
+            while (!release_first.load(memory_order_acquire)) {
+              this_thread::yield();
+            }
+          } else if (block == 1) {
+            release_first.store(true, memory_order_release);
+            throw runtime_error("ordered producer failure");
+          }
+          out << string(1024, char('a' + block % 26));
+        });
+  } catch (const runtime_error& error) {
+    producer_failed = string(error.what()) == "ordered producer failure";
+  }
+  assert(producer_failed);
+  assert(active.load() == 0);
+
+  struct FailingBuffer : streambuf {
+    streamsize xsputn(const char*, streamsize) override { return 0; }
+    int_type overflow(int_type) override { return traits_type::eof(); }
+  } failing_buffer;
+  ostream failing_output(&failing_buffer);
+  bool writer_failed = false;
+  try {
+    internal::bounded_ordered_output(
+        failing_output, 32, 4, 8,
+        [&](size_t block, ostream& out) {
+          ActiveGuard guard(active);
+          out << string(1024, char('a' + block % 26));
+        });
+  } catch (const runtime_error& error) {
+    writer_failed = string(error.what()) == "Error writing ordered output block";
+  }
+  assert(writer_failed);
+  assert(active.load() == 0);
+
+  cerr << "Bounded ordered output tests successful!" << endl;
+}
+
+template<size_t page_size>
+void test_parallel_generated_pages() {
+  size_t count = page_size * 7 + 3;
+  vector<size_t> offsets{0, page_size + 1, page_size * 4 + 2, count};
+  auto value = [](size_t i) {
+    return i % 5 == 0 ? uint64_t(0) : i % 7 == 0 ? uint64_t(1) << 40 : i * 3;
+  };
+  PagedVector<page_size> ordinary;
+  for (size_t i = 0; i < count; ++i) {
+    ordinary.push_back(value(i));
+  }
+  stringstream expected;
+  ordinary.serialize(expected);
+  auto generate = [&](size_t block, const auto& emit) {
+    for (size_t i = offsets[block]; i < offsets[block + 1]; ++i) {
+      emit(value(i));
+    }
+  };
+  for (size_t workers : {size_t(1), size_t(2), size_t(4)}) {
+    stringstream output;
+    PagedVector<page_size>::serialize_generated_parallel(
+        output, count, offsets, workers, 9, generate);
+    assert(output.str() == expected.str());
+    PagedVector<page_size> reloaded;
+    reloaded.deserialize(output);
+    for (size_t i = 0; i < count; ++i) {
+      assert(reloaded.get(i) == value(i));
+    }
+  }
+  bool invalid = false;
+  stringstream unchanged;
+  try {
+    PagedVector<page_size>::serialize_generated_parallel(
+        unchanged, count, vector<size_t>{0, count, count}, 2, 9, generate);
+  } catch (const invalid_argument&) {
+    invalid = true;
+  }
+  assert(invalid && unchanged.str().empty());
+  bool failed = false;
+  try {
+    PagedVector<page_size>::serialize_generated_parallel(
+        unchanged, count, offsets, 2, 9,
+        [](size_t, const auto&) { throw runtime_error("producer failure"); });
+  } catch (const runtime_error&) {
+    failed = true;
+  }
+  assert(failed && unchanged.str().empty());
+}
+
 void test_generated_path_serialization() {
 
   const vector<string> names{"alpha", "beta"};
@@ -820,6 +947,89 @@ void test_generated_path_serialization() {
   assert(duplicate_rejected);
 
   cerr << "Generated path serialization tests successful!" << endl;
+}
+
+void test_parallel_generated_path_serialization() {
+
+  const size_t path_count = 4;
+  const size_t steps_per_path = 1024;
+  const size_t node_count = 513;
+  const size_t budget = size_t(32) << 20;
+  auto path_name = [](size_t i) { return string("parallel-") + to_string(i); };
+
+  auto initialize = [&](PackedGraph& graph) {
+    for (size_t i = 0; i < node_count; ++i) {
+      graph.create_handle("A");
+    }
+  };
+  auto emit_paths = [&](const PackedGraph& graph, size_t i, const auto& emit) {
+    for (size_t j = 0; j < steps_per_path; ++j) {
+      emit(graph.get_handle((17 * j + 97 * i) % node_count + 1, (i + j) % 2));
+    }
+  };
+
+  PackedGraph ordinary;
+  initialize(ordinary);
+  for (size_t i = 0; i < path_count; ++i) {
+    const path_handle_t path = ordinary.create_path_handle(path_name(i));
+    for (size_t j = 0; j < steps_per_path; ++j) {
+      ordinary.append_step(path,
+                           ordinary.get_handle((17 * j + 97 * i) % node_count + 1,
+                                               (i + j) % 2));
+    }
+  }
+  stringstream expected;
+  ordinary.serialize(expected);
+
+  PackedGraph parallel;
+  initialize(parallel);
+  stringstream observed;
+  parallel.serialize_with_paths(
+      observed, path_count, path_name,
+      [&](size_t) { return steps_per_path; },
+      [&](size_t i, const auto& emit) { emit_paths(parallel, i, emit); }, 2, budget);
+  assert(observed.str() == expected.str());
+
+  PackedGraph fallback;
+  initialize(fallback);
+  stringstream fallback_output;
+  fallback.serialize_with_paths(
+      fallback_output, path_count, path_name,
+      [&](size_t) { return steps_per_path; },
+      [&](size_t i, const auto& emit) { emit_paths(fallback, i, emit); }, 2, 1);
+  assert(fallback_output.str() == expected.str());
+
+  PackedGraph invalid;
+  initialize(invalid);
+  stringstream unchanged("seed");
+  bool rejected = false;
+  try {
+    invalid.serialize_with_paths(
+        unchanged, path_count, path_name,
+        [&](size_t) { return steps_per_path; },
+        [&](size_t, const auto& emit) { emit(invalid.get_handle(1)); }, 2, budget);
+  } catch (const exception&) {
+    rejected = true;
+  }
+  assert(rejected);
+  assert(unchanged.str() == "seed");
+
+  PackedGraph producer_error;
+  initialize(producer_error);
+  stringstream error_unchanged("seed");
+  bool error_rethrown = false;
+  try {
+    producer_error.serialize_with_paths(
+        error_unchanged, path_count, path_name,
+        [&](size_t) { return steps_per_path; },
+        [](size_t, const auto&) { throw runtime_error("producer failure"); }, 2, budget);
+  } catch (const runtime_error&) {
+    error_rethrown = true;
+  }
+  assert(error_rethrown);
+  assert(error_unchanged.str() == "seed");
+
+  cerr << "Parallel generated path serialization tests successful!" << endl;
 }
 
 void test_deletable_handle_graphs() {
@@ -5531,7 +5741,12 @@ int main(void) {
   test_mutable_path_handle_graphs();
   test_deletable_handle_graphs();
   test_serializable_handle_graphs();
+  test_bounded_ordered_output();
   test_generated_path_serialization();
+  test_parallel_generated_pages<4>();
+  test_parallel_generated_pages<64>();
+  test_parallel_generated_pages<256>();
+  test_parallel_generated_path_serialization();
   test_packed_graph();
   test_path_position_overlays();
   test_packed_reference_path_overlay();
