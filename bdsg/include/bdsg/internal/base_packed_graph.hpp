@@ -199,6 +199,14 @@ public:
     /// Ignores nonexistent edges.
     /// Does not update any stored paths.
     void destroy_edge(const handle_t& left, const handle_t& right);
+
+    /// Call produce_edges once with an emitter accepting const edge_t&. The
+    /// producer must synchronously emit distinct existing edges, must not retain
+    /// the emitter, and must not otherwise mutate this graph. Paths are unchanged.
+    /// A successful nonempty producer gets one final defragmentation check.
+    /// Producer exceptions propagate, completed deletions remain, and the final check is skipped.
+    template<typename EdgeProducer>
+    void destroy_edges(EdgeProducer&& produce_edges);
     
     /// Remove all nodes and edges. Does not update any stored paths.
     void clear(void);
@@ -1843,6 +1851,23 @@ void BasePackedGraph<Backend>::destroy_edge(const handle_t& left, const handle_t
         remove_edge_reference(flip(right), flip(left));
     }
     defragment();
+}
+
+template<typename Backend>
+template<typename EdgeProducer>
+void BasePackedGraph<Backend>::destroy_edges(EdgeProducer&& produce_edges) {
+    bool removed_any = false;
+    std::forward<EdgeProducer>(produce_edges)([&](const edge_t& edge) {
+        remove_edge_reference(edge.first, edge.second);
+        if (edge.first != flip(edge.second)) {
+            // Reversing self-edges have only one adjacency record.
+            remove_edge_reference(flip(edge.second), flip(edge.first));
+        }
+        removed_any = true;
+    });
+    if (removed_any) {
+        defragment();
+    }
 }
 
 template<typename Backend>
