@@ -1346,6 +1346,9 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     // Bound section anchors, aligned block indexes, and the ordered output
     // ring before starting a producer or writing the graph header.
     constexpr size_t generated_block_values = 8192;
+    constexpr size_t bucket_padding_words = 8;
+    constexpr size_t stable_wave_bytes_per_step =
+        3 * sizeof(size_t) + sizeof(uint64_t) + 1;
     const size_t chunk_bytes = size_t(1) << 20;
     const size_t section_pages = saturated_add(ceiling_divide(total_steps, WIDE_PAGE_WIDTH),
                                                ceiling_divide(total_steps, NARROW_PAGE_WIDTH));
@@ -1359,6 +1362,46 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     const size_t packing_plan = saturated_add(planned_bytes, packing_bytes);
     const bool parallel_sections = packing_plan != maximum &&
         packing_plan <= extra_memory_budget;
+
+    // Next links need their serial recurrence grouped by node. Admit the
+    // profiled anchors, block seed copies, fixed output ring, carried heads,
+    // and at least one stable-scatter wave before selecting that route.
+    const size_t minimum_wave_steps = std::min(total_steps, generated_block_values);
+    const size_t next_pages = ceiling_divide(total_steps, NARROW_PAGE_WIDTH);
+    size_t next_bytes = saturated_multiply(next_pages, size_t(24));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        blocks + 2, size_t(16) * NARROW_PAGE_WIDTH));
+    next_bytes = saturated_add(next_bytes,
+                               saturated_multiply(blocks + 1, sizeof(size_t)));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        3 * active_workers + 2, chunk_bytes + 512));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        active_workers + 2, size_t(24) * NARROW_PAGE_WIDTH));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        saturated_add(node_count,
+                      saturated_multiply(active_workers, bucket_padding_words)),
+        sizeof(uint64_t)));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        saturated_multiply(active_workers, node_count), sizeof(uint64_t)));
+    next_bytes = saturated_add(next_bytes,
+                               saturated_multiply(active_workers, size_t(128)));
+    next_bytes = saturated_add(next_bytes, saturated_multiply(
+        minimum_wave_steps, stable_wave_bytes_per_step));
+    const size_t minimum_next_plan = saturated_add(planned_bytes, next_bytes);
+    bool parallel_next = minimum_next_plan != maximum &&
+        minimum_next_plan <= extra_memory_budget;
+    size_t wave_steps = 0;
+    if (parallel_next) {
+        const size_t additional_wave_steps =
+            (extra_memory_budget - minimum_next_plan) / stable_wave_bytes_per_step;
+        wave_steps = std::min(
+            total_steps, saturated_add(minimum_wave_steps, additional_wave_steps));
+        const size_t next_plan = saturated_add(
+            minimum_next_plan,
+            saturated_multiply(wave_steps - minimum_wave_steps,
+                               stable_wave_bytes_per_step));
+        parallel_next = next_plan != maximum && next_plan <= extra_memory_budget;
+    }
     auto section_offsets = [&](size_t page_width) {
         vector<size_t> offsets{0};
         for (size_t position = generated_block_values; position < total_steps;) {
@@ -1399,96 +1442,96 @@ void BasePackedGraph<Backend>::serialize_with_paths(
         }
     }
 
-    {
-        // Each block owns its row. Rows record final per-node heads and the
-        // extrema needed to reproduce serial packed-page width history.
-        vector<uint64_t> block_heads(std::max<size_t>(head_entries, 1), 0);
-        vector<uint64_t> page_min(std::max<size_t>(extrema_entries, 1), 0);
-        vector<uint64_t> page_max(std::max<size_t>(extrema_entries, 1), 0);
-        vector<uint64_t> final_heads(node_count, 0);
+    // Keep the incoming block heads through next-link anchor profiling. The
+    // dense rows are released before wave replay starts.
+    vector<uint64_t> block_heads(std::max<size_t>(head_entries, 1), 0);
+    vector<uint64_t> page_min(std::max<size_t>(extrema_entries, 1), 0);
+    vector<uint64_t> page_max(std::max<size_t>(extrema_entries, 1), 0);
+    vector<uint64_t> final_heads(node_count, 0);
 
-        internal::bounded_parallel_for(blocks, active_workers, [&](size_t block) {
-            uint64_t* heads = block_heads.data() + block * node_count;
-            uint64_t* minima = page_min.data() + block * node_pages;
-            uint64_t* maxima = page_max.data() + block * node_pages;
-            std::fill(heads, heads + node_count, uint64_t(0));
-            std::fill(minima, minima + node_pages, uint64_t(0));
-            std::fill(maxima, maxima + node_pages, uint64_t(0));
-            size_t membership = prefix[path_bounds[block]];
-            for (size_t i = path_bounds[block]; i < path_bounds[block + 1]; ++i) {
-                const size_t count = prefix[i + 1] - prefix[i];
-                size_t visited = 0;
-                path_steps(i, [&](const handle_t& handle) {
-                    if (visited == count) {
-                        throw std::invalid_argument("Generated path has too many steps");
-                    }
-                    if (!has_node(get_id(handle))) {
-                        throw std::invalid_argument("Generated path visits a missing node");
-                    }
-                    const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
-                    if (node >= node_count) {
-                        throw std::logic_error("Generated path node index is out of range");
-                    }
-                    const uint64_t occurrence = ++membership;
-                    heads[node] = occurrence;
-                    const size_t page = node / NARROW_PAGE_WIDTH;
-                    if (minima[page] == 0) {
-                        minima[page] = occurrence;
-                    }
-                    maxima[page] = std::max(maxima[page], occurrence);
-                    ++visited;
-                });
-                if (visited != count) {
-                    throw std::invalid_argument("Generated path has too few steps");
+    internal::bounded_parallel_for(blocks, active_workers, [&](size_t block) {
+        uint64_t* heads = block_heads.data() + block * node_count;
+        uint64_t* minima = page_min.data() + block * node_pages;
+        uint64_t* maxima = page_max.data() + block * node_pages;
+        std::fill(heads, heads + node_count, uint64_t(0));
+        std::fill(minima, minima + node_pages, uint64_t(0));
+        std::fill(maxima, maxima + node_pages, uint64_t(0));
+        size_t membership = prefix[path_bounds[block]];
+        for (size_t i = path_bounds[block]; i < path_bounds[block + 1]; ++i) {
+            const size_t count = prefix[i + 1] - prefix[i];
+            size_t visited = 0;
+            path_steps(i, [&](const handle_t& handle) {
+                if (visited == count) {
+                    throw std::invalid_argument("Generated path has too many steps");
                 }
-            }
-            if (membership != prefix[path_bounds[block + 1]]) {
-                throw std::logic_error("Generated path membership block is inconsistent");
-            }
-        });
-
-        const size_t nodes_per_task = 4096;
-        const size_t node_tasks = ceiling_divide(node_count, nodes_per_task);
-        internal::bounded_parallel_for(node_tasks, active_workers, [&](size_t task) {
-            const size_t begin = task * nodes_per_task;
-            const size_t end = std::min(node_count, begin + nodes_per_task);
-            for (size_t node = begin; node < end; ++node) {
-                uint64_t head = 0;
-                for (size_t block = 0; block < blocks; ++block) {
-                    uint64_t& cell = block_heads[block * node_count + node];
-                    const uint64_t last = cell;
-                    cell = head;
-                    if (last != 0) {
-                        head = last;
-                    }
+                if (!has_node(get_id(handle))) {
+                    throw std::invalid_argument("Generated path visits a missing node");
                 }
-                final_heads[node] = head;
-            }
-        });
-
-        for (size_t page = 0; page < node_pages; ++page) {
-            uint64_t minimum = 0;
-            uint64_t maximum_value = 0;
-            for (size_t block = 0; block < blocks; ++block) {
-                const size_t index = block * node_pages + page;
-                if (page_min[index] != 0 &&
-                    (minimum == 0 || page_min[index] < minimum)) {
-                    minimum = page_min[index];
+                const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+                if (node >= node_count) {
+                    throw std::logic_error("Generated path node index is out of range");
                 }
-                maximum_value = std::max(maximum_value, page_max[index]);
-            }
-            if (minimum == 0) {
-                continue;
-            }
-            const size_t page_begin = page * NARROW_PAGE_WIDTH;
-            metadata.path_membership_node_iv.set(page_begin, minimum);
-            metadata.path_membership_node_iv.set(page_begin, maximum_value);
-            const size_t page_end = std::min(node_count, page_begin + NARROW_PAGE_WIDTH);
-            for (size_t node = page_begin; node < page_end; ++node) {
-                metadata.path_membership_node_iv.set(node, final_heads[node]);
+                const uint64_t occurrence = ++membership;
+                heads[node] = occurrence;
+                const size_t page = node / NARROW_PAGE_WIDTH;
+                if (minima[page] == 0) {
+                    minima[page] = occurrence;
+                }
+                maxima[page] = std::max(maxima[page], occurrence);
+                ++visited;
+            });
+            if (visited != count) {
+                throw std::invalid_argument("Generated path has too few steps");
             }
         }
+        if (membership != prefix[path_bounds[block + 1]]) {
+            throw std::logic_error("Generated path membership block is inconsistent");
+        }
+    });
+
+    const size_t nodes_per_task = 4096;
+    const size_t node_tasks = ceiling_divide(node_count, nodes_per_task);
+    internal::bounded_parallel_for(node_tasks, active_workers, [&](size_t task) {
+        const size_t begin = task * nodes_per_task;
+        const size_t end = std::min(node_count, begin + nodes_per_task);
+        for (size_t node = begin; node < end; ++node) {
+            uint64_t head = 0;
+            for (size_t block = 0; block < blocks; ++block) {
+                uint64_t& cell = block_heads[block * node_count + node];
+                const uint64_t last = cell;
+                cell = head;
+                if (last != 0) {
+                    head = last;
+                }
+            }
+            final_heads[node] = head;
+        }
+    });
+
+    for (size_t page = 0; page < node_pages; ++page) {
+        uint64_t minimum = 0;
+        uint64_t maximum_value = 0;
+        for (size_t block = 0; block < blocks; ++block) {
+            const size_t index = block * node_pages + page;
+            if (page_min[index] != 0 &&
+                (minimum == 0 || page_min[index] < minimum)) {
+                minimum = page_min[index];
+            }
+            maximum_value = std::max(maximum_value, page_max[index]);
+        }
+        if (minimum == 0) {
+            continue;
+        }
+        const size_t page_begin = page * NARROW_PAGE_WIDTH;
+        metadata.path_membership_node_iv.set(page_begin, minimum);
+        metadata.path_membership_node_iv.set(page_begin, maximum_value);
+        const size_t page_end = std::min(node_count, page_begin + NARROW_PAGE_WIDTH);
+        for (size_t node = page_begin; node < page_end; ++node) {
+            metadata.path_membership_node_iv.set(node, final_heads[node]);
+        }
     }
+    vector<uint64_t>().swap(page_min);
+    vector<uint64_t>().swap(page_max);
 
     auto generate_linear = [&](const vector<size_t>& offsets, size_t block,
                                bool ids, const auto& emit) {
@@ -1532,7 +1575,51 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     auto generate_offsets = [&](size_t block, const auto& emit) {
         generate_linear(rank_offsets, block, false, emit);
     };
-    auto generate_next = [&](const auto& emit) {
+    vector<size_t> next_block_offsets;
+    if (parallel_next) {
+        next_block_offsets.reserve(path_bounds.size());
+        for (size_t boundary : path_bounds) {
+            next_block_offsets.push_back(prefix[boundary]);
+        }
+    }
+    auto generate_next_block = [&](size_t block, const auto& emit) {
+        vector<uint64_t> heads(node_count);
+        std::copy_n(block_heads.data() + block * node_count,
+                    node_count, heads.data());
+        size_t membership = prefix[path_bounds[block]];
+        for (size_t i = path_bounds[block]; i < path_bounds[block + 1]; ++i) {
+            const size_t count = prefix[i + 1] - prefix[i];
+            size_t visited = 0;
+            path_steps(i, [&](const handle_t& handle) {
+                if (visited == count) {
+                    throw std::invalid_argument(
+                        "Generated path replay has too many steps");
+                }
+                if (!has_node(get_id(handle))) {
+                    throw std::invalid_argument(
+                        "Generated path replay visits a missing node");
+                }
+                const size_t node = graph_index_to_node_member_index(
+                    graph_iv_index(handle));
+                if (node >= node_count) {
+                    throw std::logic_error(
+                        "Generated path replay node index is out of range");
+                }
+                emit(heads[node]);
+                heads[node] = ++membership;
+                ++visited;
+            });
+            if (visited != count) {
+                throw std::invalid_argument(
+                    "Generated path replay has too few steps");
+            }
+        }
+        if (membership != prefix[path_bounds[block + 1]]) {
+            throw std::logic_error(
+                "Generated path replay block is inconsistent");
+        }
+    };
+    auto generate_next_serial = [&](const auto& emit) {
         vector<uint64_t> heads(node_count, 0);
         size_t membership = 0;
         for (size_t i = 0; i < path_count; ++i) {
@@ -1546,6 +1633,10 @@ void BasePackedGraph<Backend>::serialize_with_paths(
                     throw std::invalid_argument("Generated path replay visits a missing node");
                 }
                 const size_t node = graph_index_to_node_member_index(graph_iv_index(handle));
+                if (node >= node_count) {
+                    throw std::logic_error(
+                        "Generated path replay node index is out of range");
+                }
                 emit(heads[node]);
                 heads[node] = ++membership;
                 ++visited;
@@ -1581,7 +1672,287 @@ void BasePackedGraph<Backend>::serialize_with_paths(
     }
     vector<size_t>().swap(id_offsets);
     vector<size_t>().swap(rank_offsets);
-    PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(out, total_steps, generate_next);
+    if (parallel_next) {
+        PagedVector<NARROW_PAGE_WIDTH>::serialize_generated_profiled(
+            out, total_steps, next_block_offsets, active_workers,
+            generate_next_block,
+            [&](size_t expected_pages, const auto& write_page) -> size_t {
+                // The coarse state was needed to obtain exact ordinary anchors,
+                // but retaining it during replay would crowd out useful waves.
+                vector<uint64_t>().swap(block_heads);
+
+                const size_t bucket_count = active_workers;
+                vector<vector<uint64_t>> carried_heads(bucket_count);
+                for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
+                    const size_t entries = node_count <= bucket
+                        ? size_t(0)
+                        : (node_count - 1 - bucket) / bucket_count + 1;
+                    // Keep each bucket's hot first word in a distinct
+                    // allocation of at least one cache line, even when the
+                    // graph has fewer nodes than workers.
+                    carried_heads[bucket].assign(
+                        entries + bucket_padding_words, uint64_t(0));
+                }
+
+                vector<size_t> nodes;
+                vector<size_t> bucket_positions;
+                vector<size_t> inverse_positions;
+                vector<uint64_t> bucket_values;
+                nodes.reserve(wave_steps);
+                bucket_positions.reserve(wave_steps);
+                inverse_positions.reserve(wave_steps);
+                bucket_values.reserve(wave_steps);
+                vector<uint64_t> pending_page;
+                pending_page.reserve(NARROW_PAGE_WIDTH);
+                size_t next_page = 0;
+
+                auto append_serial_value = [&](uint64_t value) {
+                    pending_page.push_back(value);
+                    if (pending_page.size() == NARROW_PAGE_WIDTH) {
+                        const size_t page = next_page++;
+                        write_page(out, page, [&](const auto& emit) {
+                            for (uint64_t item : pending_page) {
+                                emit(item);
+                            }
+                        });
+                        pending_page.clear();
+                    }
+                };
+
+                auto emit_parallel_wave = [&](size_t wave_count) {
+                    auto value_at = [&](size_t local) {
+                        return bucket_values[inverse_positions[local]];
+                    };
+                    size_t consumed = 0;
+                    while (consumed < wave_count && !pending_page.empty()) {
+                        append_serial_value(value_at(consumed++));
+                    }
+
+                    const size_t full_values =
+                        ((wave_count - consumed) / NARROW_PAGE_WIDTH) * NARROW_PAGE_WIDTH;
+                    const size_t full_pages = full_values / NARROW_PAGE_WIDTH;
+                    if (full_pages != 0) {
+                        const size_t values_per_block = generated_block_values;
+                        const size_t pages_per_block =
+                            values_per_block / NARROW_PAGE_WIDTH;
+                        const size_t output_blocks = ceiling_divide(full_pages, pages_per_block);
+                        const size_t page_base = next_page;
+                        const size_t value_base = consumed;
+                        internal::bounded_ordered_output(
+                            out, output_blocks, active_workers, chunk_bytes,
+                            [&](size_t output_block, ostream& block_out) {
+                                const size_t first_page = output_block * pages_per_block;
+                                const size_t past_page = std::min(
+                                    full_pages, first_page + pages_per_block);
+                                for (size_t local_page = first_page;
+                                     local_page < past_page; ++local_page) {
+                                    const size_t first_value = value_base +
+                                        local_page * NARROW_PAGE_WIDTH;
+                                    write_page(block_out, page_base + local_page,
+                                        [&](const auto& emit) {
+                                            for (size_t rank = 0;
+                                                 rank < NARROW_PAGE_WIDTH; ++rank) {
+                                                emit(value_at(first_value + rank));
+                                            }
+                                        });
+                                }
+                            });
+                        next_page += full_pages;
+                        consumed += full_values;
+                    }
+                    while (consumed < wave_count) {
+                        append_serial_value(value_at(consumed++));
+                    }
+                };
+
+                size_t path_begin = 0;
+                while (path_begin < path_count) {
+                    const size_t path_step_count = prefix[path_begin + 1] - prefix[path_begin];
+                    if (path_step_count > wave_steps) {
+                        // A caller can expose a single path larger than the
+                        // memory budget. Scan it once, preserving the global
+                        // recurrence while retaining only one packed page.
+                        size_t visited = 0;
+                        const size_t membership_begin = prefix[path_begin];
+                        path_steps(path_begin, [&](const handle_t& handle) {
+                            if (visited == path_step_count) {
+                                throw std::invalid_argument(
+                                    "Generated oversized path has too many steps");
+                            }
+                            if (!has_node(get_id(handle))) {
+                                throw std::invalid_argument(
+                                    "Generated oversized path visits a missing node");
+                            }
+                            const size_t node = graph_index_to_node_member_index(
+                                graph_iv_index(handle));
+                            if (node >= node_count) {
+                                throw std::logic_error(
+                                    "Generated oversized path node index is out of range");
+                            }
+                            const size_t bucket = node % bucket_count;
+                            uint64_t& head = carried_heads[bucket][node / bucket_count];
+                            append_serial_value(head);
+                            head = membership_begin + ++visited;
+                        });
+                        if (visited != path_step_count) {
+                            throw std::invalid_argument(
+                                "Generated oversized path has too few steps");
+                        }
+                        ++path_begin;
+                        continue;
+                    }
+
+                    size_t path_end = path_begin;
+                    const size_t membership_begin = prefix[path_begin];
+                    while (path_end < path_count) {
+                        const size_t candidate = prefix[path_end + 1] - membership_begin;
+                        if (candidate > wave_steps) {
+                            break;
+                        }
+                        ++path_end;
+                    }
+                    if (path_end == path_begin) {
+                        throw std::logic_error("Generated next-link wave made no progress");
+                    }
+                    const size_t wave_count = prefix[path_end] - membership_begin;
+                    if (wave_count == 0) {
+                        path_begin = path_end;
+                        continue;
+                    }
+
+                    nodes.resize(wave_count);
+                    constexpr size_t paths_per_decode_task = 64;
+                    const size_t decode_tasks = ceiling_divide(
+                        path_end - path_begin, paths_per_decode_task);
+                    internal::bounded_parallel_for(
+                        decode_tasks, active_workers, [&](size_t task) {
+                            const size_t first_path = path_begin +
+                                task * paths_per_decode_task;
+                            const size_t past_path = std::min(
+                                path_end, first_path + paths_per_decode_task);
+                            for (size_t path = first_path; path < past_path; ++path) {
+                                const size_t count = prefix[path + 1] - prefix[path];
+                                const size_t destination = prefix[path] - membership_begin;
+                                size_t visited = 0;
+                                path_steps(path, [&](const handle_t& handle) {
+                                    if (visited == count) {
+                                        throw std::invalid_argument(
+                                            "Generated next-link wave has too many steps");
+                                    }
+                                    if (!has_node(get_id(handle))) {
+                                        throw std::invalid_argument(
+                                            "Generated next-link wave visits a missing node");
+                                    }
+                                    const size_t node = graph_index_to_node_member_index(
+                                        graph_iv_index(handle));
+                                    if (node >= node_count) {
+                                        throw std::logic_error(
+                                            "Generated next-link wave node index is out of range");
+                                    }
+                                    nodes[destination + visited++] = node;
+                                });
+                                if (visited != count) {
+                                    throw std::invalid_argument(
+                                        "Generated next-link wave has too few steps");
+                                }
+                            }
+                        });
+
+                    constexpr size_t scatter_chunk_size = 8192;
+                    const size_t scatter_chunks = ceiling_divide(wave_count, scatter_chunk_size);
+                    const size_t bucket_stride = ceiling_divide(
+                        bucket_count, bucket_padding_words) * bucket_padding_words;
+                    if (scatter_chunks > maximum / bucket_stride) {
+                        throw std::overflow_error("Generated next-link scatter size overflow");
+                    }
+                    vector<size_t> chunk_bucket_starts(scatter_chunks * bucket_stride, 0);
+                    internal::bounded_parallel_for(
+                        scatter_chunks, active_workers, [&](size_t chunk) {
+                            size_t* counts = chunk_bucket_starts.data() + chunk * bucket_stride;
+                            const size_t begin = chunk * scatter_chunk_size;
+                            const size_t end = std::min(wave_count, begin + scatter_chunk_size);
+                            for (size_t position = begin; position < end; ++position) {
+                                ++counts[nodes[position] % bucket_count];
+                            }
+                        });
+
+                    vector<size_t> bucket_bounds(bucket_count + 1, 0);
+                    size_t scattered = 0;
+                    for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
+                        bucket_bounds[bucket] = scattered;
+                        for (size_t chunk = 0; chunk < scatter_chunks; ++chunk) {
+                            size_t& cell = chunk_bucket_starts[chunk * bucket_stride + bucket];
+                            const size_t count = cell;
+                            cell = scattered;
+                            scattered += count;
+                        }
+                    }
+                    bucket_bounds[bucket_count] = scattered;
+                    if (scattered != wave_count) {
+                        throw std::logic_error("Generated next-link scatter count is inconsistent");
+                    }
+
+                    bucket_positions.resize(wave_count);
+                    inverse_positions.resize(wave_count);
+                    internal::bounded_parallel_for(
+                        scatter_chunks, active_workers, [&](size_t chunk) {
+                            size_t* cursors = chunk_bucket_starts.data() + chunk * bucket_stride;
+                            const size_t begin = chunk * scatter_chunk_size;
+                            const size_t end = std::min(wave_count, begin + scatter_chunk_size);
+                            for (size_t position = begin; position < end; ++position) {
+                                const size_t bucket = nodes[position] % bucket_count;
+                                const size_t target = cursors[bucket]++;
+                                bucket_positions[target] = position;
+                                inverse_positions[position] = target;
+                            }
+                        });
+
+                    bucket_values.resize(wave_count);
+                    internal::bounded_parallel_for(
+                        bucket_count, active_workers, [&](size_t bucket) {
+                            vector<uint64_t>& heads = carried_heads[bucket];
+                            for (size_t index = bucket_bounds[bucket];
+                                 index < bucket_bounds[bucket + 1]; ++index) {
+                                const size_t position = bucket_positions[index];
+                                const size_t node = nodes[position];
+                                uint64_t& head = heads[node / bucket_count];
+                                bucket_values[index] = head;
+                                head = membership_begin + position + 1;
+                            }
+                        });
+                    emit_parallel_wave(wave_count);
+                    path_begin = path_end;
+                }
+
+                for (size_t node = 0; node < node_count; ++node) {
+                    const size_t bucket = node % bucket_count;
+                    if (carried_heads[bucket][node / bucket_count] != final_heads[node]) {
+                        throw std::invalid_argument(
+                            "Generated next links changed between profile and replay");
+                    }
+                }
+                if (!pending_page.empty()) {
+                    const size_t page = next_page++;
+                    write_page(out, page, [&](const auto& emit) {
+                        for (uint64_t item : pending_page) {
+                            emit(item);
+                        }
+                    });
+                    pending_page.clear();
+                }
+                if (next_page != expected_pages) {
+                    throw std::logic_error("Generated next-link page count is inconsistent");
+                }
+                return next_page;
+            });
+    } else {
+        vector<uint64_t>().swap(block_heads);
+        vector<uint64_t>().swap(final_heads);
+        PagedVector<NARROW_PAGE_WIDTH>::serialize_generated(
+            out, total_steps, generate_next_serial);
+    }
+    vector<size_t>().swap(next_block_offsets);
+    vector<uint64_t>().swap(final_heads);
     sdsl::write_member(metadata.inverse_char_assignment, out);
     metadata.path_names_iv.serialize(out);
     metadata.path_name_start_iv.serialize(out);

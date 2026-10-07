@@ -999,6 +999,97 @@ void test_parallel_generated_path_serialization() {
       [&](size_t i, const auto& emit) { emit_paths(fallback, i, emit); }, 2, 1);
   assert(fallback_output.str() == expected.str());
 
+  // Force a serial oversized-path scan followed by several bounded waves.
+  // Every wave revisits the same nodes, so the carried heads affect its bytes.
+  const size_t wave_path_count = 301;
+  vector<size_t> wave_sizes(wave_path_count, 200);
+  wave_sizes[0] = 40000;
+  const size_t wave_budget = size_t(25) << 20;
+  auto wave_name = [](size_t i) { return string("wave-") + to_string(i); };
+  auto emit_wave = [&](const PackedGraph& graph, size_t i, const auto& emit) {
+    for (size_t j = 0; j < wave_sizes[i]; ++j) {
+      emit(graph.get_handle((17 * j + 97 * i) % node_count + 1, (i + j) % 2));
+    }
+  };
+
+  PackedGraph wave_ordinary;
+  initialize(wave_ordinary);
+  for (size_t i = 0; i < wave_path_count; ++i) {
+    const path_handle_t path = wave_ordinary.create_path_handle(wave_name(i));
+    emit_wave(wave_ordinary, i, [&](const handle_t& handle) {
+      wave_ordinary.append_step(path, handle);
+    });
+  }
+  stringstream wave_expected;
+  wave_ordinary.serialize(wave_expected);
+
+  PackedGraph wave_parallel;
+  initialize(wave_parallel);
+  stringstream wave_observed;
+  wave_parallel.serialize_with_paths(
+      wave_observed, wave_path_count, wave_name,
+      [&](size_t i) { return wave_sizes[i]; },
+      [&](size_t i, const auto& emit) { emit_wave(wave_parallel, i, emit); },
+      2, wave_budget);
+  assert(wave_observed.str() == wave_expected.str());
+
+  PackedGraph four_workers;
+  initialize(four_workers);
+  stringstream four_worker_output;
+  four_workers.serialize_with_paths(
+      four_worker_output, wave_path_count, wave_name,
+      [&](size_t i) { return wave_sizes[i]; },
+      [&](size_t i, const auto& emit) { emit_wave(four_workers, i, emit); },
+      4, size_t(48) << 20);
+  assert(four_worker_output.str() == wave_expected.str());
+
+  // Change one replay after preflight. The final per-node heads must detect it.
+  PackedGraph changed_replay;
+  initialize(changed_replay);
+  vector<size_t> replay_calls(wave_path_count, 0);
+  bool changed_rejected = false;
+  try {
+    stringstream ignored;
+    changed_replay.serialize_with_paths(
+        ignored, wave_path_count, wave_name,
+        [&](size_t i) { return wave_sizes[i]; },
+        [&](size_t i, const auto& emit) {
+          const size_t call = ++replay_calls[i];
+          if (i + 1 == wave_path_count && call > 2) {
+            for (size_t j = 0; j < wave_sizes[i]; ++j) {
+              emit(changed_replay.get_handle(1));
+            }
+          } else {
+            emit_wave(changed_replay, i, emit);
+          }
+        }, 2, wave_budget);
+  } catch (const invalid_argument&) {
+    changed_rejected = true;
+  }
+  assert(changed_rejected);
+
+  // Throw inside a parallel decode task. All workers must join before rethrow.
+  PackedGraph worker_error;
+  initialize(worker_error);
+  vector<size_t> worker_calls(wave_path_count, 0);
+  bool worker_rethrown = false;
+  try {
+    stringstream ignored;
+    worker_error.serialize_with_paths(
+        ignored, wave_path_count, wave_name,
+        [&](size_t i) { return wave_sizes[i]; },
+        [&](size_t i, const auto& emit) {
+          const size_t call = ++worker_calls[i];
+          if (i == 65 && call > 2) {
+            throw runtime_error("worker replay failure");
+          }
+          emit_wave(worker_error, i, emit);
+        }, 2, wave_budget);
+  } catch (const runtime_error&) {
+    worker_rethrown = true;
+  }
+  assert(worker_rethrown);
+
   PackedGraph invalid;
   initialize(invalid);
   stringstream unchanged("seed");
