@@ -818,6 +818,32 @@ void test_bounded_ordered_output() {
 }
 
 template<size_t page_size>
+void test_generated_robust_pages() {
+  for (size_t count : {size_t(0), size_t(1), page_size - 1, page_size,
+                       page_size + 1, page_size * 2 + 1, page_size * 7 + 3}) {
+    auto value = [](size_t i) { return i % 5 == 0 ? uint64_t(0) : i % 7 == 0 ? uint64_t(1) << 40 : i * 3; };
+    auto generate = [&](const auto& emit) {
+      for (size_t i = 0; i < count; ++i) {
+        emit(value(i));
+      }
+    };
+    RobustPagedVector<page_size> ordinary;
+    for (size_t i = 0; i < count; ++i) {
+      ordinary.push_back(value(i));
+    }
+    stringstream expected, output;
+    ordinary.serialize(expected);
+    RobustPagedVector<page_size>::serialize_generated(output, count, generate);
+    assert(output.str() == expected.str());
+    RobustPagedVector<page_size> reloaded;
+    reloaded.deserialize(output);
+    for (size_t i = 0; i < count; ++i) {
+      assert(reloaded.get(i) == value(i));
+    }
+  }
+}
+
+template<size_t page_size>
 void test_parallel_generated_pages() {
   size_t count = page_size * 7 + 3;
   vector<size_t> offsets{0, page_size + 1, page_size * 4 + 2, count};
@@ -5746,6 +5772,9 @@ int main(void) {
   test_parallel_generated_pages<4>();
   test_parallel_generated_pages<64>();
   test_parallel_generated_pages<256>();
+  test_generated_robust_pages<4>();
+  test_generated_robust_pages<64>();
+  test_generated_robust_pages<256>();
   test_parallel_generated_path_serialization();
   test_packed_graph();
   test_path_position_overlays();
