@@ -5354,6 +5354,44 @@ void test_hub_labeling() {
   cerr << "HubLabeling tests successful!" << endl;
 }
 
+void test_dense_distance_staging() {
+  for (bool root : {false, true}) {
+    SnarlDistanceIndex::TemporaryDistanceIndex::TemporarySnarlRecord record;
+    record.is_root_snarl = root;
+    record.node_count = 2;
+    record.allocate_staged_distances();
+    size_t first = root ? 0 : 2;
+    record.stage_distance(first, false, first + 1, true, 12);
+    record.stage_distance(first + 1, true, first, false, 12);
+    bool conflict = false;
+    try {
+      record.stage_distance(first + 1, true, first, false, 24);
+    } catch (const runtime_error&) {
+      conflict = true;
+    }
+    assert(conflict);
+    record.stage_distance(first, false, first + 1, true, 12);
+
+    size_t wide = numeric_limits<size_t>::max() - 1;
+    record.stage_distance(first, true, first + 1, false, wide);
+    record.stage_distance(first + 1, false, first, true, wide);
+    conflict = false;
+    try {
+      record.stage_distance(first, true, first + 1, false, wide + 1);
+    } catch (const runtime_error&) {
+      conflict = true;
+    }
+    assert(conflict);
+    bool invalid_rank = false;
+    try {
+      record.stage_distance(first + 2, false, first, false, 0);
+    } catch (const out_of_range&) {
+      invalid_rank = true;
+    }
+    assert(invalid_rank);
+  }
+}
+
 void test_snarl_distance_index() {
 
   char filename[] = "tmpXXXXXX";
@@ -5457,5 +5495,6 @@ int main(void) {
   test_mapped_packed_graph();
   test_hash_graph();
   test_hub_labeling();
+  test_dense_distance_staging();
   test_snarl_distance_index();
 }

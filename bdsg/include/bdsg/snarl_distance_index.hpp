@@ -1929,12 +1929,33 @@ public:
             //The ranks & orientations of children that are tips
             unordered_map<size_t, bool> tippy_child_ranks;
             //vector<tuple<pair<size_t, bool>, pair<size_t, bool>, size_t>> distances;
+            //Legacy staging used by existing producers and language bindings
             unordered_map<pair<pair<size_t, bool>, pair<size_t, bool>>, size_t> distances;
+            //Size the staging array for the distance vector of a snarl with node_count children
+            void allocate_staged_distances();
+            //Stage the distance between two child sides. Repeating an equal distance is allowed;
+            //a conflicting distance violates the one-distance-per-unordered-side-pair invariant.
+            void stage_distance(size_t rank1, bool right_side1, size_t rank2, bool right_side2, size_t distance);
+
             //linearized hub labels (if not empty, this is an oversized snarl)
             vector<size_t> hub_labels;
          
             //How long is the record going to be in the distance index?
             size_t get_max_record_length() const ;
+
+        private:
+            //Distances between internal child sides, staged in the layout of the finished
+            //record's distance vector. An entry is distance+1, 0 if unset, or
+            //STAGED_DISTANCE_OVERFLOW if the distance is in distance_overflow.
+            vector<uint32_t> staged_distances;
+            unordered_map<size_t, size_t> distance_overflow;
+            static const uint32_t STAGED_DISTANCE_OVERFLOW = std::numeric_limits<uint32_t>::max();
+
+            size_t staged_distance_offset(size_t rank1, bool right_side1,
+                                          size_t rank2, bool right_side2) const;
+            void for_each_staged_distance(const std::function<void(size_t, bool, size_t, bool, size_t)>& iteratee) const;
+
+            friend class SnarlDistanceIndex;
         };
         struct TemporaryNodeRecord : TemporaryRecord{
             TemporaryNodeRecord() :
