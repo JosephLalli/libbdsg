@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <iostream>
+#include <type_traits>
 #include <vector>
 #include <random>
 #include <sdsl/int_vector.hpp>
@@ -214,6 +215,13 @@ public:
     
     /// Output contents to a stream
     void serialize(ostream& out) const ;
+
+    /// Serialize a fresh append-only vector without retaining all values.
+    /// generate(emit) must be replayable and emit exactly count values on each
+    /// pass.
+    template<class Generator>
+    static void serialize_generated(ostream& out, size_t count,
+                                    Generator&& generate);
     
     /// Set the i-th value
     inline void set(const size_t& i, const uint64_t& value);
@@ -1085,6 +1093,92 @@ void PagedVector<page_size, Backend>::serialize(ostream& out) const  {
     anchors.serialize(out);
     for (size_t i = 0; i < pages.size(); i++) {
         pages[i].serialize(out);
+    }
+}
+
+template<size_t page_size, typename Backend>
+template<class Generator>
+void PagedVector<page_size, Backend>::serialize_generated(
+    ostream& out, size_t count, Generator&& generate) {
+    static_assert(page_size > 0, "Generated PagedVector pages must be nonempty");
+    static_assert(std::is_same<Backend, STLBackend>::value,
+                  "Generated PagedVector serialization requires STLBackend");
+
+    // Reproduce the exact PackedVector mutation history of the anchors while
+    // validating callback cardinality before writing anything.
+    PackedVector<STLBackend> generated_anchors;
+    size_t generated_count = 0;
+    bool first_pass_overrun = false;
+    auto collect_anchor = [&](uint64_t value) {
+        if (generated_count == count) {
+            first_pass_overrun = true;
+            throw std::length_error("Generated PagedVector emitted too many values");
+        }
+        if (generated_count % page_size == 0) {
+            generated_anchors.push_back(0);
+        }
+        const size_t page = generated_count / page_size;
+        if (generated_anchors.get(page) == 0) {
+            // PagedVector::set() performs this even when value is also zero.
+            generated_anchors.set(page, value);
+        }
+        ++generated_count;
+    };
+    generate(collect_anchor);
+    if (first_pass_overrun || generated_count != count) {
+        throw std::length_error("Generated PagedVector emitted the wrong number of values");
+    }
+
+    sdsl::write_member(count, out);
+    sdsl::write_member(page_size, out);
+    generated_anchors.serialize(out);
+    if (!out) {
+        throw std::runtime_error("Error writing generated PagedVector header");
+    }
+
+    // push_back() creates the same fixed-size PackedVector page as a resident
+    // append-only PagedVector. clear() destroys that page and resets anchors
+    // and filled, so the next emplace constructs a fresh width-1 page while
+    // reusing only the outer std::vector allocation.
+    PagedVector<page_size, STLBackend> scratch;
+    size_t replayed_count = 0;
+    size_t serialized_pages = 0;
+    bool second_pass_overrun = false;
+    auto serialize_page = [&]() {
+        if (scratch.pages.size() != 1 || scratch.anchors.size() != 1 ||
+            serialized_pages >= generated_anchors.size()) {
+            throw std::logic_error("Generated PagedVector scratch page is inconsistent");
+        }
+        if (scratch.anchors.get(0) != generated_anchors.get(serialized_pages)) {
+            throw std::invalid_argument("Generated PagedVector changed between passes");
+        }
+        scratch.pages[0].serialize(out);
+        if (!out) {
+            throw std::runtime_error("Error writing generated PagedVector page");
+        }
+        ++serialized_pages;
+        scratch.clear();
+    };
+    auto collect_page = [&](uint64_t value) {
+        if (replayed_count == count) {
+            second_pass_overrun = true;
+            throw std::length_error("Generated PagedVector replay emitted too many values");
+        }
+        scratch.push_back(value);
+        ++replayed_count;
+        if (scratch.size() == page_size) {
+            serialize_page();
+        }
+    };
+    generate(collect_page);
+    if (second_pass_overrun || replayed_count != count) {
+        throw std::length_error("Generated PagedVector replay emitted the wrong number of values");
+    }
+    if (!scratch.empty()) {
+        serialize_page();
+    }
+    if (serialized_pages != generated_anchors.size()) {
+        throw std::logic_error("Generated PagedVector page count is inconsistent");
     }
 }
 

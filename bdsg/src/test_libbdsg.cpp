@@ -739,6 +739,89 @@ void test_serializable_handle_graphs() {
   cerr << "SerializableHandleGraph tests successful!" << endl;
 }
 
+void test_generated_path_serialization() {
+
+  const vector<string> names{"alpha", "beta"};
+  const vector<vector<pair<nid_t, bool>>> walks{
+      {{1, false}, {2, false}, {3, true}},
+      {{1, true}, {3, false}}};
+
+  auto initialize = [](PackedGraph& graph) {
+    const handle_t h1 = graph.create_handle("A");
+    const handle_t h2 = graph.create_handle("CG");
+    const handle_t h3 = graph.create_handle("T");
+    graph.create_edge(h1, h2);
+    graph.create_edge(h2, h3);
+
+    // An empty deleted path leaves a slot and name storage but no memberships.
+    const path_handle_t retired = graph.create_path_handle("retired");
+    graph.destroy_path(retired);
+  };
+
+  PackedGraph ordinary;
+  initialize(ordinary);
+  for (size_t i = 0; i < names.size(); ++i) {
+    const path_handle_t path = ordinary.create_path_handle(names[i]);
+    for (const auto& step : walks[i]) {
+      ordinary.append_step(path, ordinary.get_handle(step.first, step.second));
+    }
+  }
+  stringstream ordinary_serialized;
+  ordinary.serialize(ordinary_serialized);
+
+  PackedGraph generated;
+  initialize(generated);
+  assert(generated.can_serialize_with_generated_paths());
+  stringstream generated_serialized;
+  generated.serialize_with_paths(
+      generated_serialized, names.size(),
+      [&](size_t i) { return names[i]; },
+      [&](size_t i) { return walks[i].size(); },
+      [&](size_t i, const auto& emit) {
+        for (const auto& step : walks[i]) {
+          emit(generated.get_handle(step.first, step.second));
+        }
+      });
+  assert(generated_serialized.str() == ordinary_serialized.str());
+
+  generated_serialized.seekg(0);
+  PackedGraph restored;
+  restored.deserialize(generated_serialized);
+  for (size_t i = 0; i < names.size(); ++i) {
+    const path_handle_t path = restored.get_path_handle(names[i]);
+    assert(restored.get_step_count(path) == walks[i].size());
+    step_handle_t step = restored.path_begin(path);
+    for (const auto& expected : walks[i]) {
+      assert(restored.get_handle_of_step(step) ==
+             restored.get_handle(expected.first, expected.second));
+      step = restored.get_next_step(step);
+    }
+    assert(step == restored.path_end(path));
+  }
+
+  PackedGraph ineligible;
+  initialize(ineligible);
+  ineligible.create_path_handle("live");
+  assert(!ineligible.can_serialize_with_generated_paths());
+
+  PackedGraph duplicate_names;
+  initialize(duplicate_names);
+  bool duplicate_rejected = false;
+  try {
+    stringstream ignored;
+    duplicate_names.serialize_with_paths(
+        ignored, 2,
+        [](size_t) { return string("duplicate"); },
+        [](size_t) { return size_t(0); },
+        [](size_t, const auto&) {});
+  } catch (const exception&) {
+    duplicate_rejected = true;
+  }
+  assert(duplicate_rejected);
+
+  cerr << "Generated path serialization tests successful!" << endl;
+}
+
 void test_deletable_handle_graphs() {
 
   // first batch of tests
@@ -5448,6 +5531,7 @@ int main(void) {
   test_mutable_path_handle_graphs();
   test_deletable_handle_graphs();
   test_serializable_handle_graphs();
+  test_generated_path_serialization();
   test_packed_graph();
   test_path_position_overlays();
   test_packed_reference_path_overlay();

@@ -25,6 +25,19 @@ using namespace handlegraph;
  * In-memory implementation of MutablePathDeletableHandleGraph
  */
 class PackedGraph : public GraphProxy<BasePackedGraph<>> {
+public:
+    bool can_serialize_with_generated_paths() const {
+        return get()->can_serialize_with_generated_paths();
+    }
+
+    /// Serialize replayable walks into ordinary PackedGraph path storage.
+    template<class PathName, class PathSize, class PathSteps>
+    void serialize_with_paths(std::ostream& out, size_t path_count,
+                              const PathName& path_name, const PathSize& path_size,
+                              const PathSteps& path_steps) const {
+        get()->serialize_with_paths(out, path_count, path_name, path_size, path_steps);
+    }
+
 protected:
     /**
      * Get the object that actually provides the graph methods.
