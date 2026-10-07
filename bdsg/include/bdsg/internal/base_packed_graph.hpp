@@ -1069,9 +1069,6 @@ void BasePackedGraph<Backend>::serialize_with_paths(
             throw std::overflow_error("Generated path membership count overflow");
         }
         const string name = path_name(i);
-        if (metadata.has_path(name)) {
-            throw std::invalid_argument("Generated path name already exists");
-        }
         const path_handle_t path = metadata.create_path_handle(name, false);
         const size_t slot = first_path + i;
         if (as_integer(path) != slot) {
